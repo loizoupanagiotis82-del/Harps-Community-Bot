@@ -19,6 +19,8 @@ STAFF_ROLE_NAMES = [
 
 TICKET_CATEGORY_NAME = "🎫 TICKETS"
 TICKET_LOG_CATEGORY_NAME = "📁 TICKET LOGS"
+SERVER_STATS_CATEGORY_NAME = "📊 SERVER STATS"
+MEMBER_COUNT_CHANNEL_PREFIX = "👥 Members:"
 WELCOME_CHANNEL_NAME = "📜・welcome"
 GOODBYE_CHANNEL_NAME = "📜・goodbye"
 
@@ -76,6 +78,53 @@ def staff_overwrites(guild: discord.Guild) -> dict:
                 attach_files=True,
             )
     return overwrites
+
+
+async def update_member_count(
+    guild: discord.Guild, *, create_if_missing: bool = False
+) -> discord.VoiceChannel | None:
+    """Create or refresh the server's read-only member counter channel."""
+    category = discord.utils.get(guild.categories, name=SERVER_STATS_CATEGORY_NAME)
+    channel = discord.utils.find(
+        lambda item: item.name.startswith(MEMBER_COUNT_CHANNEL_PREFIX),
+        category.voice_channels if category else guild.voice_channels,
+    )
+
+    if channel is None and not create_if_missing:
+        return None
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True, connect=False
+        )
+    }
+    if guild.me is not None:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True, connect=True, manage_channels=True
+        )
+
+    if category is None:
+        category = await guild.create_category(
+            SERVER_STATS_CATEGORY_NAME,
+            overwrites=overwrites,
+            reason="Harps Community server statistics setup",
+        )
+
+    member_total = guild.member_count or len(guild.members)
+    expected_name = f"{MEMBER_COUNT_CHANNEL_PREFIX} {member_total}"
+    if channel is None:
+        channel = await guild.create_voice_channel(
+            expected_name,
+            category=category,
+            overwrites=overwrites,
+            reason="Harps Community member counter setup",
+        )
+    elif channel.name != expected_name:
+        await channel.edit(
+            name=expected_name,
+            reason="Harps Community member count changed",
+        )
+    return channel
 
 
 async def get_ticket_log_channel(
@@ -468,21 +517,45 @@ bot.add_view(CloseTicketView())
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
+    for guild in bot.guilds:
+        try:
+            await update_member_count(guild)
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"Could not update member counter in {guild.name}: {error}")
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
     await send_welcome(member)
+    try:
+        await update_member_count(member.guild)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"Could not update member counter in {member.guild.name}: {error}")
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
     await send_goodbye(member)
+    try:
+        await update_member_count(member.guild)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"Could not update member counter in {member.guild.name}: {error}")
 
 
 @bot.command()
 async def ping(ctx: commands.Context):
     await ctx.send(f"🏓 Pong! {round(bot.latency * 1000)}ms")
+
+
+@bot.command()
+async def membercount(ctx: commands.Context):
+    member_total = ctx.guild.member_count or len(ctx.guild.members)
+    embed = discord.Embed(
+        title="👥 Harps Community Members",
+        description=f"We currently have **{member_total:,} members** in the server!",
+        color=discord.Color.blurple(),
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.command()
@@ -497,6 +570,19 @@ async def testwelcome(ctx: commands.Context):
 async def testgoodbye(ctx: commands.Context):
     if not await send_goodbye(ctx.author):
         await ctx.send(f"Goodbye channel `{GOODBYE_CHANNEL_NAME}` was not found.")
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setupmembercount(ctx: commands.Context):
+    try:
+        channel = await update_member_count(ctx.guild, create_if_missing=True)
+    except discord.Forbidden:
+        await ctx.send(
+            "I could not create the counter. Please give me the Manage Channels permission."
+        )
+        return
+    await ctx.send(f"✅ Live member counter ready: {channel.mention}")
 
 
 @bot.command()
@@ -524,6 +610,7 @@ async def ticketpanel(ctx: commands.Context):
 
 
 @ticketpanel.error
+@setupmembercount.error
 @testwelcome.error
 @testgoodbye.error
 async def admin_command_error(ctx: commands.Context, error: commands.CommandError):
