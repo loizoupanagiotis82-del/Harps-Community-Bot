@@ -72,4 +72,30 @@ async def testwelcome(ctx):
     )
 
     await ctx.send(embed=embed)
+@bot.event
+async def on_member_remove(member):
+    channel = discord.utils.get(
+        member.guild.text_channels,
+        name="🫡・goodbye"
+    )
+
+    if channel:
+        embed = discord.Embed(
+            title="🫡 GOODBYE!",
+            description=(
+                f"**{member.display_name}** has left Harps Community.\n\n"
+                f"Thanks for being part of the community! 👋"
+            ),
+            color=discord.Color.red(),
+            timestamp=discord.utils.utcnow()
+        )
+
+        embed.set_thumbnail(url=member.display_avatar.url)
+
+        embed.set_footer(
+            text=f"Harps Community  •  {member.guild.member_count} members remaining",
+            icon_url=member.guild.icon.url if member.guild.icon else None
+        )
+
+        await channel.send(embed=embed)
 bot.run(TOKEN)
