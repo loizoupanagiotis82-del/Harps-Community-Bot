@@ -5077,7 +5077,6 @@ async def lfg(ctx: commands.Context):
 @commands.bot_has_permissions(
     manage_channels=True,
     manage_messages=True,
-    move_members=True,
     view_channel=True,
     send_messages=True,
 )
