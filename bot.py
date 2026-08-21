@@ -66,6 +66,7 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 ticket_creation_locks: dict[tuple[int, int, str], asyncio.Lock] = {}
+slash_commands_synced = False
 
 
 def is_staff(member: discord.Member) -> bool:
@@ -646,7 +647,16 @@ bot.add_view(CloseTicketView())
 
 @bot.event
 async def on_ready():
+    global slash_commands_synced
     print(f"✅ Logged in as {bot.user}")
+    if not slash_commands_synced:
+        try:
+            synced_commands = await bot.tree.sync()
+        except discord.HTTPException as error:
+            print(f"Could not sync slash commands: {error}")
+        else:
+            slash_commands_synced = True
+            print(f"✅ Synced {len(synced_commands)} slash commands")
     for guild in bot.guilds:
         try:
             await update_member_count(guild)
@@ -692,12 +702,12 @@ async def on_member_remove(member: discord.Member):
         )
 
 
-@bot.command()
+@bot.hybrid_command()
 async def ping(ctx: commands.Context):
     await ctx.send(f"🏓 Pong! {round(bot.latency * 1000)}ms")
 
 
-@bot.command()
+@bot.hybrid_command()
 async def membercount(ctx: commands.Context):
     member_total = ctx.guild.member_count or len(ctx.guild.members)
     embed = discord.Embed(
@@ -708,7 +718,7 @@ async def membercount(ctx: commands.Context):
     await ctx.send(embed=embed)
 
 
-@bot.command(aliases=["purge"])
+@bot.hybrid_command(aliases=["purge"])
 @commands.has_permissions(manage_messages=True)
 @commands.bot_has_permissions(manage_messages=True)
 @commands.cooldown(1, 3, commands.BucketType.channel)
@@ -737,7 +747,7 @@ async def clear(ctx: commands.Context, amount: int = 10):
         pass
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(kick_members=True)
 @commands.bot_has_permissions(kick_members=True)
 async def kick(
@@ -760,7 +770,7 @@ async def kick(
     )
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(ban_members=True)
 @commands.bot_has_permissions(ban_members=True)
 async def ban(
@@ -787,7 +797,7 @@ async def ban(
     )
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(ban_members=True)
 @commands.bot_has_permissions(ban_members=True)
 async def unban(
@@ -813,7 +823,7 @@ async def unban(
     )
 
 
-@bot.command(aliases=["mute"])
+@bot.hybrid_command(aliases=["mute"])
 @commands.has_permissions(moderate_members=True)
 @commands.bot_has_permissions(moderate_members=True)
 async def timeout(
@@ -850,7 +860,7 @@ async def timeout(
     )
 
 
-@bot.command(aliases=["unmute"])
+@bot.hybrid_command(aliases=["unmute"])
 @commands.has_permissions(moderate_members=True)
 @commands.bot_has_permissions(moderate_members=True)
 async def untimeout(
@@ -875,7 +885,7 @@ async def untimeout(
     )
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(manage_messages=True)
 async def warn(
     ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"
@@ -904,7 +914,7 @@ async def warn(
     )
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(manage_channels=True)
 @commands.bot_has_permissions(manage_channels=True)
 async def lock(ctx: commands.Context):
@@ -926,7 +936,7 @@ async def lock(ctx: commands.Context):
     )
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(manage_channels=True)
 @commands.bot_has_permissions(manage_channels=True)
 async def unlock(ctx: commands.Context):
@@ -949,7 +959,7 @@ async def unlock(ctx: commands.Context):
     )
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(manage_channels=True)
 @commands.bot_has_permissions(manage_channels=True)
 async def slowmode(ctx: commands.Context, seconds: int = 0):
@@ -975,21 +985,21 @@ async def slowmode(ctx: commands.Context, seconds: int = 0):
     )
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(administrator=True)
 async def testwelcome(ctx: commands.Context):
     if not await send_welcome(ctx.author):
         await ctx.send(f"Welcome channel `{WELCOME_CHANNEL_NAME}` was not found.")
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(administrator=True)
 async def testgoodbye(ctx: commands.Context):
     if not await send_goodbye(ctx.author):
         await ctx.send(f"Goodbye channel `{GOODBYE_CHANNEL_NAME}` was not found.")
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(administrator=True)
 async def setupmembercount(ctx: commands.Context):
     try:
@@ -1002,7 +1012,7 @@ async def setupmembercount(ctx: commands.Context):
     await ctx.send(f"✅ Live member counter ready: {channel.mention}")
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(administrator=True)
 async def setupmodlogs(ctx: commands.Context):
     try:
@@ -1021,7 +1031,7 @@ async def setupmodlogs(ctx: commands.Context):
     )
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(manage_messages=True)
 async def modhelp(ctx: commands.Context):
     embed = discord.Embed(
@@ -1059,7 +1069,7 @@ async def modhelp(ctx: commands.Context):
     await ctx.send(embed=embed)
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(administrator=True)
 async def rules(ctx: commands.Context):
     channel = discord.utils.get(ctx.guild.text_channels, name=RULES_CHANNEL_NAME)
@@ -1079,7 +1089,7 @@ async def rules(ctx: commands.Context):
     await ctx.send(f"✅ Οι κανόνες δημοσιεύτηκαν στο {channel.mention}.")
 
 
-@bot.command()
+@bot.hybrid_command()
 @commands.has_permissions(administrator=True)
 async def ticketpanel(ctx: commands.Context):
     embed = discord.Embed(
