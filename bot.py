@@ -29,6 +29,8 @@ GOODBYE_CHANNEL_NAME = "📜・goodbye"
 RULES_CHANNEL_NAME = "📚server-rules"
 MOD_LOG_CATEGORY_NAME = "🛡️ MODERATION LOGS"
 AUTO_ROLE_NAME = "🔥│Regulars"
+ROLE_REQUEST_PANEL_CHANNEL_NAME = "🕴role-request"
+ROLE_REQUEST_CATEGORY_NAME = "🎭 ROLE REQUESTS"
 SERVER_LOG_CATEGORY_NAME = "📋 SERVER LOGS"
 ANTINUKE_WHITELIST_ROLE_NAME = "🛡️ Anti-Nuke Whitelist"
 ANTINUKE_MASS_THRESHOLD = 3
@@ -36,6 +38,10 @@ ANTINUKE_WINDOW_SECONDS = 10
 
 # IDs placed here are always trusted, including bots that are not in the server yet.
 ANTINUKE_WHITELIST_IDS: set[int] = set()
+
+# Leave empty to show every safe, non-staff role (up to Discord's 25-option
+# limit), or add exact role names here to control what members may request.
+ROLE_REQUEST_ALLOWED_ROLE_NAMES: list[str] = []
 
 SERVER_LOG_CHANNELS = {
     "member": "member-logs",
@@ -87,6 +93,8 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 ticket_creation_locks: dict[tuple[int, int, str], asyncio.Lock] = {}
+role_request_locks: dict[tuple[int, int], asyncio.Lock] = {}
+role_decision_locks: dict[int, asyncio.Lock] = {}
 antinuke_activity: dict[tuple[int, int, str], deque[float]] = defaultdict(deque)
 antinuke_triggered: set[tuple[int, int]] = set()
 server_log_setup_locks: dict[int, asyncio.Lock] = {}
@@ -832,15 +840,360 @@ async def send_goodbye(member: discord.Member) -> bool:
     if channel is None:
         return False
 
+    member_total = member.guild.member_count or len(member.guild.members)
+    time_with_server = "Unknown"
+    if member.joined_at is not None:
+        days = max((discord.utils.utcnow() - member.joined_at).days, 0)
+        time_with_server = f"{days} day{'s' if days != 1 else ''}"
+
     embed = discord.Embed(
-        title="👋 Goodbye from Harps Community",
-        description=f"**{member.display_name}** has left the server. We hope to see them again!",
-        color=discord.Color.red(),
+        title="🌙 Until Next Time...",
+        description=(
+            f"**{member.display_name}** has left **{member.guild.name}**.\n\n"
+            "Thank you for being part of Harps Community. The door is always open, "
+            "and we hope our paths cross again someday. 👋"
+        ),
+        color=discord.Color.from_rgb(126, 87, 194),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="🕒 Time with us", value=time_with_server, inline=True)
+    embed.add_field(name="👥 Members remaining", value=f"{member_total:,}", inline=True)
+    embed.add_field(
+        name="💜 From Harps Community",
+        value="Thank you for the memories, conversations and moments you shared with us.",
+        inline=False,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=f"👥 Members remaining: {member.guild.member_count}")
+    if member.guild.icon is not None:
+        embed.set_author(name=member.guild.name, icon_url=member.guild.icon.url)
+    if member.guild.banner is not None:
+        embed.set_image(url=member.guild.banner.url)
+    embed.set_footer(text="Harps Community • Farewell and take care!")
     await channel.send(embed=embed)
     return True
+
+
+def role_is_safe_to_request(guild: discord.Guild, role: discord.Role) -> bool:
+    if role.is_default() or role.managed:
+        return False
+    if role.name in STAFF_ROLE_NAMES or role.name in {
+        AUTO_ROLE_NAME,
+        ANTINUKE_WHITELIST_ROLE_NAME,
+    }:
+        return False
+    if ROLE_REQUEST_ALLOWED_ROLE_NAMES and role.name not in ROLE_REQUEST_ALLOWED_ROLE_NAMES:
+        return False
+    permissions = role.permissions
+    if any(
+        (
+            permissions.administrator,
+            permissions.manage_guild,
+            permissions.manage_roles,
+            permissions.manage_channels,
+            permissions.manage_webhooks,
+            permissions.ban_members,
+            permissions.kick_members,
+            permissions.moderate_members,
+            permissions.manage_messages,
+            permissions.mention_everyone,
+        )
+    ):
+        return False
+    return guild.me is not None and role < guild.me.top_role
+
+
+def requestable_roles(
+    guild: discord.Guild, member: discord.Member
+) -> list[discord.Role]:
+    roles = [
+        role
+        for role in guild.roles
+        if role not in member.roles and role_is_safe_to_request(guild, role)
+    ]
+    return sorted(roles, key=lambda role: role.name.casefold())[:25]
+
+
+def role_request_details(channel: discord.TextChannel) -> tuple[int, int] | None:
+    match = re.search(
+        r"harps-role-request:user=(\d+);role=(\d+)", channel.topic or ""
+    )
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+async def create_role_request(
+    interaction: discord.Interaction, role_id: int
+) -> None:
+    guild = interaction.guild
+    if guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "Role requests can only be opened inside the server.", ephemeral=True
+        )
+        return
+    role = guild.get_role(role_id)
+    if role is None or role in interaction.user.roles or not role_is_safe_to_request(
+        guild, role
+    ):
+        await interaction.response.send_message(
+            "That role is no longer available to request.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    lock_key = (guild.id, interaction.user.id)
+    lock = role_request_locks.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        existing = discord.utils.find(
+            lambda item: (item.topic or "").startswith(
+                f"harps-role-request:user={interaction.user.id};"
+            ),
+            guild.text_channels,
+        )
+        if existing is not None:
+            await interaction.followup.send(
+                f"You already have an open role request: {existing.mention}",
+                ephemeral=True,
+            )
+            return
+
+        overwrites = staff_overwrites(guild)
+        overwrites[interaction.user] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+        )
+        category = discord.utils.get(guild.categories, name=ROLE_REQUEST_CATEGORY_NAME)
+        try:
+            if category is None:
+                category = await guild.create_category(
+                    ROLE_REQUEST_CATEGORY_NAME,
+                    overwrites=staff_overwrites(guild),
+                    reason="Harps Community role request setup",
+                )
+            safe_name = re.sub(r"[^a-z0-9-]", "-", interaction.user.name.lower())
+            safe_name = re.sub(r"-+", "-", safe_name).strip("-") or "member"
+            channel = await guild.create_text_channel(
+                f"role-request-{safe_name}"[:100],
+                category=category,
+                overwrites=overwrites,
+                topic=f"harps-role-request:user={interaction.user.id};role={role.id}",
+                reason=f"Role request opened by {interaction.user} ({interaction.user.id})",
+            )
+        except (discord.Forbidden, discord.HTTPException) as error:
+            await interaction.followup.send(
+                f"I could not create the private request channel: `{error}`",
+                ephemeral=True,
+            )
+            return
+        finally:
+            role_request_locks.pop(lock_key, None)
+
+        embed = discord.Embed(
+            title="🎭 New Role Request",
+            description=(
+                f"{interaction.user.mention} is requesting {role.mention}.\n\n"
+                "The member may add any helpful context in this private channel. "
+                "Authorized staff can approve or deny the request below."
+            ),
+            color=role.color if role.color.value else discord.Color.blurple(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(
+            name="Member",
+            value=f"{interaction.user.mention}\n`{interaction.user.id}`",
+            inline=True,
+        )
+        embed.add_field(name="Requested role", value=f"{role.mention}\n`{role.id}`", inline=True)
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.set_footer(text="Harps Community • Role Request Review")
+        await channel.send(
+            content=interaction.user.mention,
+            embed=embed,
+            view=RoleRequestDecisionView(),
+        )
+        await interaction.followup.send(
+            f"✅ Your private role request is ready: {channel.mention}", ephemeral=True
+        )
+
+
+class RoleRequestSelect(discord.ui.Select):
+    def __init__(self, roles: list[discord.Role]):
+        self.role_ids = {str(role.id): role.id for role in roles}
+        options = [
+            discord.SelectOption(
+                label=role.name[:100],
+                value=str(role.id),
+                description="Request this role from the staff team",
+                emoji="🎭",
+            )
+            for role in roles
+        ]
+        super().__init__(
+            placeholder="Choose the role you want to request...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="harps:role_request:select",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await create_role_request(interaction, int(self.values[0]))
+
+
+class RoleRequestSelectView(discord.ui.View):
+    def __init__(self, roles: list[discord.Role]):
+        super().__init__(timeout=120)
+        self.add_item(RoleRequestSelect(roles))
+
+
+class RoleRequestPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Request a Role",
+        style=discord.ButtonStyle.primary,
+        emoji="🎭",
+        custom_id="harps:role_request:open",
+    )
+    async def open_request(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if interaction.guild is None or not isinstance(
+            interaction.user, discord.Member
+        ):
+            await interaction.response.send_message(
+                "This panel only works inside the server.", ephemeral=True
+            )
+            return
+        roles = requestable_roles(interaction.guild, interaction.user)
+        if not roles:
+            await interaction.response.send_message(
+                "There are no safe roles available for you to request right now.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "Choose the role you would like the staff team to review:",
+            view=RoleRequestSelectView(roles),
+            ephemeral=True,
+        )
+
+
+class RoleRequestDecisionView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if isinstance(interaction.user, discord.Member) and is_staff(interaction.user):
+            return True
+        await interaction.response.send_message(
+            "Only authorized Harps Community staff can review role requests.",
+            ephemeral=True,
+        )
+        return False
+
+    async def finish_request(
+        self, interaction: discord.Interaction, *, approved: bool
+    ) -> None:
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "This is not a role request channel.", ephemeral=True
+            )
+            return
+        details = role_request_details(channel)
+        if details is None:
+            await interaction.response.send_message(
+                "This request has invalid or missing metadata.", ephemeral=True
+            )
+            return
+        lock = role_decision_locks.setdefault(channel.id, asyncio.Lock())
+        if lock.locked():
+            await interaction.response.send_message(
+                "Another staff member is already processing this request.", ephemeral=True
+            )
+            return
+
+        async with lock:
+            requester_id, role_id = details
+            member = channel.guild.get_member(requester_id)
+            role = channel.guild.get_role(role_id)
+            if member is None or role is None:
+                await interaction.response.send_message(
+                    "The member or requested role no longer exists.", ephemeral=True
+                )
+                return
+
+            if approved:
+                if not role_is_safe_to_request(channel.guild, role):
+                    await interaction.response.send_message(
+                        "This role is no longer safe or assignable, so the request was not approved.",
+                        ephemeral=True,
+                    )
+                    return
+                try:
+                    await member.add_roles(
+                        role,
+                        reason=f"Role request approved by {interaction.user} ({interaction.user.id})",
+                    )
+                except (discord.Forbidden, discord.HTTPException) as error:
+                    await interaction.response.send_message(
+                        f"I could not assign the role: `{error}`", ephemeral=True
+                    )
+                    return
+                result = f"✅ {member.mention}'s request for {role.mention} was approved by {interaction.user.mention}."
+                title = "✅ Role Request Approved"
+                color = discord.Color.green()
+            else:
+                result = f"❌ {member.mention}'s request for {role.mention} was denied by {interaction.user.mention}."
+                title = "❌ Role Request Denied"
+                color = discord.Color.red()
+
+            await interaction.response.send_message(result)
+            await send_server_log(
+                channel.guild,
+                "role",
+                title,
+                result,
+                color=color,
+                fields=[
+                    ("Member ID", str(member.id), True),
+                    ("Role ID", str(role.id), True),
+                    ("Reviewed by", f"{interaction.user} (`{interaction.user.id}`)", False),
+                ],
+            )
+            await asyncio.sleep(5)
+            try:
+                await channel.delete(
+                    reason=f"Role request {'approved' if approved else 'denied'} by {interaction.user}"
+                )
+            except discord.NotFound:
+                pass
+            finally:
+                role_decision_locks.pop(channel.id, None)
+
+    @discord.ui.button(
+        label="Accept",
+        style=discord.ButtonStyle.success,
+        emoji="✅",
+        custom_id="harps:role_request:accept",
+    )
+    async def accept(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self.finish_request(interaction, approved=True)
+
+    @discord.ui.button(
+        label="Deny",
+        style=discord.ButtonStyle.danger,
+        emoji="❌",
+        custom_id="harps:role_request:deny",
+    )
+    async def deny(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self.finish_request(interaction, approved=False)
 
 
 class CloseConfirmationView(discord.ui.View):
@@ -1091,6 +1444,8 @@ class TicketPanelView(discord.ui.View):
 # Register persistent views before connecting so their buttons survive restarts.
 bot.add_view(TicketPanelView())
 bot.add_view(CloseTicketView())
+bot.add_view(RoleRequestPanelView())
+bot.add_view(RoleRequestDecisionView())
 
 
 @bot.event
@@ -2224,6 +2579,55 @@ async def rules(ctx: commands.Context):
 
 @bot.hybrid_command()
 @commands.has_permissions(administrator=True)
+async def rolerequestpanel(ctx: commands.Context):
+    """Post the persistent role-request panel in the configured channel."""
+    channel = discord.utils.get(
+        ctx.guild.text_channels, name=ROLE_REQUEST_PANEL_CHANNEL_NAME
+    )
+    if channel is None:
+        channel = discord.utils.find(
+            lambda item: item.name.endswith("role-request"), ctx.guild.text_channels
+        )
+    if channel is None:
+        await ctx.send(
+            f"I could not find the `{ROLE_REQUEST_PANEL_CHANNEL_NAME}` channel."
+        )
+        return
+
+    embed = discord.Embed(
+        title="🎭 Harps Community Role Requests",
+        description=(
+            "Want a community role? Click **Request a Role** below, choose from the "
+            "available roles and a private review channel will be created for you."
+        ),
+        color=discord.Color.from_rgb(171, 71, 188),
+    )
+    embed.add_field(
+        name="📋 How it works",
+        value=(
+            "**1.** Click the button and choose a role.\n"
+            "**2.** Add any helpful context in your private request.\n"
+            "**3.** An authorized staff member will accept or deny it."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔐 Safe and private",
+        value=(
+            "Only you and authorized staff can see your request. Staff, managed and "
+            "dangerous-permission roles are never available through this panel."
+        ),
+        inline=False,
+    )
+    if ctx.guild.icon is not None:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+    embed.set_footer(text="Harps Community • One open role request per member")
+    await channel.send(embed=embed, view=RoleRequestPanelView())
+    await ctx.send(f"✅ Role-request panel posted in {channel.mention}.")
+
+
+@bot.hybrid_command()
+@commands.has_permissions(administrator=True)
 async def ticketpanel(ctx: commands.Context):
     embed = discord.Embed(
         title="🎫 Harps Community Support",
@@ -2247,6 +2651,7 @@ async def ticketpanel(ctx: commands.Context):
 
 
 @ticketpanel.error
+@rolerequestpanel.error
 @rules.error
 @antinuke_unwhitelist.error
 @antinuke_whitelist.error
