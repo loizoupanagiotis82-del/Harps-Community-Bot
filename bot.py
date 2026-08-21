@@ -1,4 +1,5 @@
 import asyncio
+import io
 import os
 import re
 
@@ -17,8 +18,15 @@ STAFF_ROLE_NAMES = [
 ]
 
 TICKET_CATEGORY_NAME = "🎫 TICKETS"
+TICKET_LOG_CATEGORY_NAME = "📁 TICKET LOGS"
 WELCOME_CHANNEL_NAME = "📜・welcome"
 GOODBYE_CHANNEL_NAME = "📜・goodbye"
+
+TICKET_TYPES = {
+    "general": ("General Support", "general-support-logs"),
+    "report": ("Report a Member", "member-report-logs"),
+    "partnership": ("Partnership / Other", "partnership-other-logs"),
+}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -41,6 +49,138 @@ def ticket_topic(user_id: int, ticket_type: str) -> str:
 def ticket_creator_id(channel: discord.TextChannel) -> int | None:
     match = re.search(r"harps-ticket:user=(\d+);", channel.topic or "")
     return int(match.group(1)) if match else None
+
+
+def ticket_type_from_channel(channel: discord.TextChannel) -> str | None:
+    match = re.search(r";type=([a-z-]+)", channel.topic or "")
+    return match.group(1) if match else None
+
+
+def staff_overwrites(guild: discord.Guild) -> dict:
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+    }
+    if guild.me is not None:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+        )
+    for role in guild.roles:
+        if role.name in STAFF_ROLE_NAMES:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+            )
+    return overwrites
+
+
+async def get_ticket_log_channel(
+    guild: discord.Guild, ticket_type: str
+) -> discord.TextChannel:
+    type_label, log_channel_name = TICKET_TYPES.get(
+        ticket_type, (ticket_type.title(), "other-ticket-logs")
+    )
+    overwrites = staff_overwrites(guild)
+    category = discord.utils.get(guild.categories, name=TICKET_LOG_CATEGORY_NAME)
+    if category is None:
+        category = await guild.create_category(
+            TICKET_LOG_CATEGORY_NAME,
+            overwrites=overwrites,
+            reason="Harps Community ticket logging setup",
+        )
+
+    channel = discord.utils.get(category.text_channels, name=log_channel_name)
+    if channel is None:
+        channel = await guild.create_text_channel(
+            log_channel_name,
+            category=category,
+            overwrites=overwrites,
+            topic=f"Closed {type_label} ticket transcripts and audit logs",
+            reason="Harps Community ticket logging setup",
+        )
+    return channel
+
+
+async def build_ticket_transcript(channel: discord.TextChannel) -> tuple[bytes, int]:
+    lines = [
+        "HARPS COMMUNITY TICKET TRANSCRIPT",
+        f"Channel: #{channel.name} ({channel.id})",
+        f"Created: {discord.utils.format_dt(channel.created_at, style='F')}",
+        "=" * 72,
+        "",
+    ]
+    message_count = 0
+    async for message in channel.history(limit=None, oldest_first=True):
+        message_count += 1
+        timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        lines.append(
+            f"[{timestamp}] {message.author} ({message.author.id}): "
+            f"{message.clean_content or '[no text content]'}"
+        )
+        for attachment in message.attachments:
+            lines.append(f"    Attachment: {attachment.filename} — {attachment.url}")
+        for embed in message.embeds:
+            lines.append(
+                f"    Embed: {embed.title or '[no title]'} — "
+                f"{embed.description or '[no description]'}"
+            )
+        if message.edited_at:
+            lines.append(
+                f"    Edited: {message.edited_at.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+            )
+        lines.append("")
+    return "\n".join(lines).encode("utf-8"), message_count
+
+
+async def log_closed_ticket(
+    channel: discord.TextChannel, closed_by: discord.Member | discord.User
+) -> None:
+    creator_id = ticket_creator_id(channel)
+    ticket_type = ticket_type_from_channel(channel) or "other"
+    type_label = TICKET_TYPES.get(ticket_type, (ticket_type.title(), ""))[0]
+    transcript, message_count = await build_ticket_transcript(channel)
+    log_channel = await get_ticket_log_channel(channel.guild, ticket_type)
+
+    embed = discord.Embed(
+        title="🔒 Ticket Closed",
+        description="A complete transcript is attached to this log entry.",
+        color=discord.Color.red(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Ticket category", value=type_label, inline=True)
+    embed.add_field(name="Ticket channel", value=f"#{channel.name}\n`{channel.id}`", inline=True)
+    embed.add_field(
+        name="Ticket creator",
+        value=f"<@{creator_id}>\n`{creator_id}`" if creator_id else "Unknown",
+        inline=True,
+    )
+    embed.add_field(
+        name="Closed by",
+        value=f"{closed_by.mention}\n`{closed_by.id}`",
+        inline=True,
+    )
+    embed.add_field(
+        name="Opened",
+        value=discord.utils.format_dt(channel.created_at, style="F"),
+        inline=True,
+    )
+    embed.add_field(
+        name="Closed",
+        value=discord.utils.format_dt(discord.utils.utcnow(), style="F"),
+        inline=True,
+    )
+    embed.add_field(name="Messages recorded", value=str(message_count), inline=True)
+    embed.add_field(name="Topic metadata", value=f"`{channel.topic or 'None'}`", inline=False)
+    embed.set_footer(text="Harps Community • Ticket Audit Log")
+
+    transcript_file = discord.File(
+        io.BytesIO(transcript), filename=f"transcript-{channel.name}-{channel.id}.txt"
+    )
+    await log_channel.send(embed=embed, file=transcript_file)
 
 
 async def send_welcome(member: discord.Member) -> bool:
@@ -114,10 +254,26 @@ class CloseConfirmationView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(
-            content="🔒 Ticket confirmed. This channel will be deleted in 5 seconds.",
-            view=self,
+            content="🔒 Saving the complete ticket log and transcript...", view=self
         )
         self.stop()
+        try:
+            await log_closed_ticket(interaction.channel, interaction.user)
+        except (discord.Forbidden, discord.HTTPException) as error:
+            await interaction.edit_original_response(
+                content=(
+                    "❌ I could not save the ticket log, so this channel was not deleted. "
+                    "Please check my Manage Channels, View Channel, Send Messages, "
+                    f"Attach Files, and Read Message History permissions. (`{error}`)"
+                ),
+                view=self,
+            )
+            return
+
+        await interaction.edit_original_response(
+            content="✅ Ticket logged successfully. This channel will be deleted in 5 seconds.",
+            view=self,
+        )
         await asyncio.sleep(5)
         try:
             await interaction.channel.delete(
