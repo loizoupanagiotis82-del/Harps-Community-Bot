@@ -150,6 +150,12 @@ def shortened(value: object, limit: int = 1000) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def server_banner_url(guild: discord.Guild) -> str | None:
+    """Return the best full-width server artwork Discord makes available."""
+    artwork = guild.banner or guild.splash or guild.discovery_splash
+    return artwork.with_size(1024).url if artwork is not None else None
+
+
 async def get_server_log_channel(
     guild: discord.Guild, log_type: str, *, create_if_missing: bool = True
 ) -> discord.TextChannel | None:
@@ -810,8 +816,9 @@ async def send_welcome(member: discord.Member) -> bool:
             name=member.guild.name,
             icon_url=member.guild.icon.url,
         )
-    if member.guild.banner is not None:
-        embed.set_image(url=member.guild.banner.url)
+    banner_url = server_banner_url(member.guild)
+    if banner_url is not None:
+        embed.set_image(url=banner_url)
     embed.set_footer(
         text=f"Harps Community • Member #{member_total:,} • Welcome aboard!"
     )
@@ -866,8 +873,9 @@ async def send_goodbye(member: discord.Member) -> bool:
     embed.set_thumbnail(url=member.display_avatar.url)
     if member.guild.icon is not None:
         embed.set_author(name=member.guild.name, icon_url=member.guild.icon.url)
-    if member.guild.banner is not None:
-        embed.set_image(url=member.guild.banner.url)
+    banner_url = server_banner_url(member.guild)
+    if banner_url is not None:
+        embed.set_image(url=banner_url)
     embed.set_footer(text="Harps Community • Farewell and take care!")
     await channel.send(embed=embed)
     return True
