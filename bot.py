@@ -2,6 +2,8 @@ import asyncio
 import io
 import os
 import re
+import time
+from collections import defaultdict, deque
 from datetime import timedelta
 
 import discord
@@ -27,6 +29,24 @@ GOODBYE_CHANNEL_NAME = "📜・goodbye"
 RULES_CHANNEL_NAME = "📚server-rules"
 MOD_LOG_CATEGORY_NAME = "🛡️ MODERATION LOGS"
 AUTO_ROLE_NAME = "🔥│Regulars"
+SERVER_LOG_CATEGORY_NAME = "📋 SERVER LOGS"
+ANTINUKE_WHITELIST_ROLE_NAME = "🛡️ Anti-Nuke Whitelist"
+ANTINUKE_MASS_THRESHOLD = 3
+ANTINUKE_WINDOW_SECONDS = 10
+
+# IDs placed here are always trusted, including bots that are not in the server yet.
+ANTINUKE_WHITELIST_IDS: set[int] = set()
+
+SERVER_LOG_CHANNELS = {
+    "member": "member-logs",
+    "message": "message-logs",
+    "reaction": "reaction-logs",
+    "voice": "voice-logs",
+    "channel": "channel-logs",
+    "role": "role-logs",
+    "server": "server-logs",
+    "antinuke": "anti-nuke-logs",
+}
 
 MOD_LOG_CHANNELS = {
     "kick": "kick-logs",
@@ -67,6 +87,11 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 ticket_creation_locks: dict[tuple[int, int, str], asyncio.Lock] = {}
+antinuke_activity: dict[tuple[int, int, str], deque[float]] = defaultdict(deque)
+antinuke_triggered: set[tuple[int, int]] = set()
+server_log_setup_locks: dict[int, asyncio.Lock] = {}
+recent_member_removals: dict[int, deque[tuple[float, int]]] = defaultdict(deque)
+last_member_removal_check: dict[int, float] = {}
 slash_commands_synced = False
 
 
@@ -110,6 +135,333 @@ def staff_overwrites(guild: discord.Guild) -> dict:
                 attach_files=True,
             )
     return overwrites
+
+
+def shortened(value: object, limit: int = 1000) -> str:
+    text = str(value) if value not in (None, "") else "[none]"
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+async def get_server_log_channel(
+    guild: discord.Guild, log_type: str, *, create_if_missing: bool = True
+) -> discord.TextChannel | None:
+    channel_name = SERVER_LOG_CHANNELS.get(log_type, SERVER_LOG_CHANNELS["server"])
+    category = discord.utils.get(guild.categories, name=SERVER_LOG_CATEGORY_NAME)
+    if category is not None:
+        existing = discord.utils.get(category.text_channels, name=channel_name)
+        if existing is not None or not create_if_missing:
+            return existing
+    elif not create_if_missing:
+        return None
+
+    lock = server_log_setup_locks.setdefault(guild.id, asyncio.Lock())
+    async with lock:
+        category = discord.utils.get(guild.categories, name=SERVER_LOG_CATEGORY_NAME)
+        if category is None:
+            category = await guild.create_category(
+                SERVER_LOG_CATEGORY_NAME,
+                overwrites=staff_overwrites(guild),
+                reason="Harps Community server logging setup",
+            )
+        channel = discord.utils.get(category.text_channels, name=channel_name)
+        if channel is None:
+            channel = await guild.create_text_channel(
+                channel_name,
+                category=category,
+                overwrites=staff_overwrites(guild),
+                topic=f"Harps Community {channel_name.replace('-', ' ')}",
+                reason="Harps Community server logging setup",
+            )
+        return channel
+
+
+async def ensure_server_logging(guild: discord.Guild) -> list[discord.TextChannel]:
+    channels = []
+    for log_type in SERVER_LOG_CHANNELS:
+        channel = await get_server_log_channel(guild, log_type)
+        if channel is not None:
+            channels.append(channel)
+    return channels
+
+
+async def send_server_log(
+    guild: discord.Guild,
+    log_type: str,
+    title: str,
+    description: str,
+    *,
+    color: discord.Color = discord.Color.blurple(),
+    fields: list[tuple[str, str, bool]] | None = None,
+) -> bool:
+    try:
+        channel = await get_server_log_channel(guild, log_type)
+        if channel is None:
+            return False
+        embed = discord.Embed(
+            title=title,
+            description=shortened(description, 4000),
+            color=color,
+            timestamp=discord.utils.utcnow(),
+        )
+        for name, value, inline in fields or []:
+            embed.add_field(
+                name=shortened(name, 250), value=shortened(value, 1024), inline=inline
+            )
+        embed.set_footer(text="Harps Community • Server Audit Log")
+        await channel.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"Could not save {log_type} log in {guild.name}: {error}")
+        return False
+
+
+def is_antinuke_whitelisted(guild: discord.Guild, user: discord.abc.User) -> bool:
+    if user.id in ANTINUKE_WHITELIST_IDS:
+        return True
+    if guild.owner_id == user.id or (bot.user is not None and bot.user.id == user.id):
+        return True
+    member = guild.get_member(user.id)
+    return member is not None and any(
+        role.name == ANTINUKE_WHITELIST_ROLE_NAME for role in member.roles
+    )
+
+
+async def ensure_antinuke_whitelist_role(guild: discord.Guild) -> discord.Role:
+    role = discord.utils.get(guild.roles, name=ANTINUKE_WHITELIST_ROLE_NAME)
+    if role is None:
+        role = await guild.create_role(
+            name=ANTINUKE_WHITELIST_ROLE_NAME,
+            permissions=discord.Permissions.none(),
+            reason="Harps Community anti-nuke setup",
+        )
+    return role
+
+
+async def find_recent_audit_entry(
+    guild: discord.Guild,
+    action: discord.AuditLogAction,
+    *,
+    target_id: int | None = None,
+    attempts: int = 4,
+) -> discord.AuditLogEntry | None:
+    for attempt in range(attempts):
+        try:
+            async for entry in guild.audit_logs(limit=8, action=action):
+                age = (discord.utils.utcnow() - entry.created_at).total_seconds()
+                if age > 15:
+                    continue
+                entry_target_id = getattr(entry.target, "id", None)
+                if target_id is None or entry_target_id == target_id:
+                    return entry
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"Could not read audit logs in {guild.name}: {error}")
+            return None
+        if attempt < attempts - 1:
+            await asyncio.sleep(0.8)
+    return None
+
+
+def record_antinuke_action(
+    guild_id: int, actor_id: int, action_name: str, weight: int = 1
+) -> int:
+    key = (guild_id, actor_id, action_name)
+    timestamps = antinuke_activity[key]
+    now = time.monotonic()
+    cutoff = now - ANTINUKE_WINDOW_SECONDS
+    while timestamps and timestamps[0] < cutoff:
+        timestamps.popleft()
+    timestamps.extend([now] * max(weight, 1))
+    return len(timestamps)
+
+
+async def punish_nuke_actor(
+    guild: discord.Guild,
+    actor: discord.abc.User,
+    detection: str,
+    details: str,
+) -> bool:
+    if is_antinuke_whitelisted(guild, actor):
+        await send_server_log(
+            guild,
+            "antinuke",
+            "🛡️ Whitelisted Action Ignored",
+            f"{actor.mention} (`{actor.id}`) triggered **{detection}**, but is whitelisted.",
+            color=discord.Color.green(),
+            fields=[("Details", details, False)],
+        )
+        return False
+
+    trigger_key = (guild.id, actor.id)
+    if trigger_key in antinuke_triggered:
+        return False
+    antinuke_triggered.add(trigger_key)
+
+    member = guild.get_member(actor.id)
+    if member is not None and guild.me is not None and member.top_role >= guild.me.top_role:
+        await send_server_log(
+            guild,
+            "antinuke",
+            "🚨 Anti-Nuke Could Not Ban Actor",
+            f"{actor.mention} (`{actor.id}`) triggered **{detection}**, but their role is above mine.",
+            color=discord.Color.red(),
+            fields=[("Details", details, False)],
+        )
+        return False
+
+    try:
+        await guild.ban(
+            actor,
+            reason=f"Anti-nuke: {detection} | {details}"[:512],
+            delete_message_seconds=0,
+        )
+    except (discord.Forbidden, discord.HTTPException) as error:
+        await send_server_log(
+            guild,
+            "antinuke",
+            "🚨 Anti-Nuke Ban Failed",
+            f"Failed to ban {actor.mention} (`{actor.id}`) after **{detection}**.",
+            color=discord.Color.red(),
+            fields=[("Details", details, False), ("Error", str(error), False)],
+        )
+        return False
+
+    await send_server_log(
+        guild,
+        "antinuke",
+        "🔨 Anti-Nuke Ban",
+        f"{actor.mention} (`{actor.id}`) was automatically banned.",
+        color=discord.Color.red(),
+        fields=[("Detection", detection, True), ("Details", details, False)],
+    )
+    return True
+
+
+async def check_mass_action(
+    guild: discord.Guild,
+    actor: discord.abc.User,
+    action_name: str,
+    detection: str,
+    details: str,
+    *,
+    weight: int = 1,
+) -> None:
+    if is_antinuke_whitelisted(guild, actor):
+        return
+    count = record_antinuke_action(guild.id, actor.id, action_name, weight)
+    if count >= ANTINUKE_MASS_THRESHOLD:
+        await punish_nuke_actor(
+            guild,
+            actor,
+            detection,
+            f"{details} | {count} actions within {ANTINUKE_WINDOW_SECONDS} seconds",
+        )
+
+
+async def handle_unauthorized_bot_add(member: discord.Member) -> bool:
+    if not member.bot:
+        return False
+    entry = await find_recent_audit_entry(
+        member.guild, discord.AuditLogAction.bot_add, target_id=member.id
+    )
+    if entry is None or entry.user is None:
+        await send_server_log(
+            member.guild,
+            "antinuke",
+            "⚠️ Bot Addition Could Not Be Verified",
+            f"{member.mention} (`{member.id}`) joined, but the inviter could not be read from Audit Logs.",
+            color=discord.Color.orange(),
+        )
+        return False
+
+    inviter = entry.user
+    if is_antinuke_whitelisted(member.guild, inviter) or is_antinuke_whitelisted(
+        member.guild, member
+    ):
+        await send_server_log(
+            member.guild,
+            "antinuke",
+            "✅ Authorized Bot Added",
+            f"{member.mention} (`{member.id}`) was added by {inviter.mention} (`{inviter.id}`).",
+            color=discord.Color.green(),
+        )
+        return False
+
+    bot_banned = False
+    try:
+        await member.guild.ban(
+            member,
+            reason=f"Anti-nuke: unauthorized bot added by {inviter} ({inviter.id})",
+            delete_message_seconds=0,
+        )
+        bot_banned = True
+    except (discord.Forbidden, discord.HTTPException) as error:
+        await send_server_log(
+            member.guild,
+            "antinuke",
+            "🚨 Unauthorized Bot Ban Failed",
+            f"Could not ban {member.mention} (`{member.id}`).",
+            color=discord.Color.red(),
+            fields=[("Inviter", f"{inviter.mention} (`{inviter.id}`)", True), ("Error", str(error), False)],
+        )
+
+    await punish_nuke_actor(
+        member.guild,
+        inviter,
+        "Unauthorized bot addition",
+        f"Added bot {member} ({member.id}); bot banned: {bot_banned}",
+    )
+    return bot_banned
+
+
+async def check_recent_member_removals(guild: discord.Guild, member_id: int) -> None:
+    now = time.monotonic()
+    removals = recent_member_removals[guild.id]
+    removals.append((now, member_id))
+    cutoff = now - ANTINUKE_WINDOW_SECONDS
+    while removals and removals[0][0] < cutoff:
+        removals.popleft()
+    if len(removals) < ANTINUKE_MASS_THRESHOLD:
+        return
+    if now - last_member_removal_check.get(guild.id, 0.0) < 2.0:
+        return
+    last_member_removal_check[guild.id] = now
+
+    recently_removed_ids = {removed_id for _, removed_id in removals}
+    kick_counts: dict[int, tuple[discord.abc.User, int]] = {}
+    try:
+        async for entry in guild.audit_logs(limit=30):
+            age = (discord.utils.utcnow() - entry.created_at).total_seconds()
+            if age > ANTINUKE_WINDOW_SECONDS + 5:
+                continue
+            if entry.user is None:
+                continue
+            if entry.action == discord.AuditLogAction.kick:
+                target_id = getattr(entry.target, "id", None)
+                if target_id not in recently_removed_ids:
+                    continue
+                actor, count = kick_counts.get(entry.user.id, (entry.user, 0))
+                kick_counts[entry.user.id] = (actor, count + 1)
+            elif entry.action == discord.AuditLogAction.member_prune:
+                removed_count = int(getattr(entry.extra, "members_removed", 0) or 0)
+                if removed_count >= ANTINUKE_MASS_THRESHOLD:
+                    await punish_nuke_actor(
+                        guild,
+                        entry.user,
+                        "Mass member prune",
+                        f"Pruned {removed_count} members",
+                    )
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"Could not inspect member removals in {guild.name}: {error}")
+        return
+
+    for actor, count in kick_counts.values():
+        if count >= ANTINUKE_MASS_THRESHOLD:
+            await punish_nuke_actor(
+                guild,
+                actor,
+                "Mass member kicks",
+                f"Kicked {count} members within {ANTINUKE_WINDOW_SECONDS} seconds",
+            )
 
 
 async def get_mod_log_channel(
@@ -706,6 +1058,11 @@ async def on_ready():
             )
     for guild in bot.guilds:
         try:
+            await ensure_server_logging(guild)
+            await ensure_antinuke_whitelist_role(guild)
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"Could not initialize server logs/anti-nuke in {guild.name}: {error}")
+        try:
             await update_member_count(guild)
         except (discord.Forbidden, discord.HTTPException) as error:
             print(f"Could not update member counter in {guild.name}: {error}")
@@ -723,6 +1080,24 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member: discord.Member):
+    await send_server_log(
+        member.guild,
+        "member",
+        "📥 Member Joined",
+        f"{member.mention} (`{member.id}`) joined the server.",
+        color=discord.Color.green(),
+        fields=[
+            ("Account created", discord.utils.format_dt(member.created_at, style="F"), False),
+            ("Bot", "Yes" if member.bot else "No", True),
+            ("Member count", str(member.guild.member_count or len(member.guild.members)), True),
+        ],
+    )
+    if member.bot and await handle_unauthorized_bot_add(member):
+        try:
+            await update_member_count(member.guild)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return
     try:
         await give_regular_role(member)
     except (discord.Forbidden, discord.HTTPException, RuntimeError) as error:
@@ -746,6 +1121,19 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
+    await send_server_log(
+        member.guild,
+        "member",
+        "📤 Member Left",
+        f"{member.mention} (`{member.id}`) left or was removed from the server.",
+        color=discord.Color.red(),
+        fields=[
+            ("Username", str(member), True),
+            ("Bot", "Yes" if member.bot else "No", True),
+            ("Joined", discord.utils.format_dt(member.joined_at, style="F") if member.joined_at else "Unknown", False),
+        ],
+    )
+    await check_recent_member_removals(member.guild, member.id)
     await send_goodbye(member)
     try:
         await update_member_count(member.guild)
@@ -761,6 +1149,456 @@ async def on_member_remove(member: discord.Member):
             reason="Member left or was removed from the server",
             color=discord.Color.red(),
         )
+
+
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User | discord.Member):
+    entry = await find_recent_audit_entry(
+        guild, discord.AuditLogAction.ban, target_id=user.id
+    )
+    actor = entry.user if entry else None
+    await send_server_log(
+        guild,
+        "member",
+        "🔨 Member Banned",
+        f"{user.mention} (`{user.id}`) was banned.",
+        color=discord.Color.red(),
+        fields=[
+            ("Action by", f"{actor.mention} (`{actor.id}`)" if actor else "Unknown", False),
+            ("Reason", entry.reason if entry and entry.reason else "No reason provided", False),
+        ],
+    )
+    if actor is not None:
+        await check_mass_action(
+            guild,
+            actor,
+            "member_ban",
+            "Mass member bans",
+            f"Banned {user} ({user.id})",
+        )
+
+
+@bot.event
+async def on_member_unban(guild: discord.Guild, user: discord.User):
+    antinuke_triggered.discard((guild.id, user.id))
+    entry = await find_recent_audit_entry(
+        guild, discord.AuditLogAction.unban, target_id=user.id, attempts=2
+    )
+    actor = entry.user if entry else None
+    await send_server_log(
+        guild,
+        "member",
+        "✅ Member Unbanned",
+        f"{user.mention} (`{user.id}`) was unbanned.",
+        color=discord.Color.green(),
+        fields=[
+            ("Action by", f"{actor.mention} (`{actor.id}`)" if actor else "Unknown", False),
+            ("Reason", entry.reason if entry and entry.reason else "No reason provided", False),
+        ],
+    )
+
+
+@bot.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel):
+    entry = await find_recent_audit_entry(
+        channel.guild,
+        discord.AuditLogAction.channel_create,
+        target_id=channel.id,
+        attempts=2,
+    )
+    actor = entry.user if entry else None
+    await send_server_log(
+        channel.guild,
+        "channel",
+        "➕ Channel Created",
+        f"**{channel.name}** (`{channel.id}`) was created.",
+        color=discord.Color.green(),
+        fields=[("Action by", f"{actor.mention} (`{actor.id}`)" if actor else "Unknown", False)],
+    )
+
+
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    entry = await find_recent_audit_entry(
+        channel.guild, discord.AuditLogAction.channel_delete, target_id=channel.id
+    )
+    actor = entry.user if entry else None
+    await send_server_log(
+        channel.guild,
+        "channel",
+        "➖ Channel Deleted",
+        f"**{channel.name}** (`{channel.id}`) was deleted.",
+        color=discord.Color.red(),
+        fields=[("Action by", f"{actor.mention} (`{actor.id}`)" if actor else "Unknown", False)],
+    )
+    if actor is not None:
+        await punish_nuke_actor(
+            channel.guild,
+            actor,
+            "Channel deletion",
+            f"Deleted {channel.name} ({channel.id})",
+        )
+    else:
+        await send_server_log(
+            channel.guild,
+            "antinuke",
+            "⚠️ Channel Deletion Actor Unknown",
+            f"Could not identify who deleted **{channel.name}** (`{channel.id}`); no automatic ban was attempted.",
+            color=discord.Color.orange(),
+        )
+
+
+@bot.event
+async def on_guild_channel_update(
+    before: discord.abc.GuildChannel, after: discord.abc.GuildChannel
+):
+    changes = []
+    if before.name != after.name:
+        changes.append(f"Name: `{before.name}` → `{after.name}`")
+    if before.category_id != after.category_id:
+        changes.append(f"Category ID: `{before.category_id}` → `{after.category_id}`")
+    if not changes:
+        return
+    entry = await find_recent_audit_entry(
+        after.guild,
+        discord.AuditLogAction.channel_update,
+        target_id=after.id,
+        attempts=1,
+    )
+    actor = entry.user if entry else None
+    await send_server_log(
+        after.guild,
+        "channel",
+        "✏️ Channel Updated",
+        f"{after.mention} (`{after.id}`) was updated.",
+        fields=[
+            ("Changes", "\n".join(changes), False),
+            ("Action by", f"{actor.mention} (`{actor.id}`)" if actor else "Unknown", False),
+        ],
+    )
+
+
+@bot.event
+async def on_guild_role_create(role: discord.Role):
+    entry = await find_recent_audit_entry(
+        role.guild, discord.AuditLogAction.role_create, target_id=role.id
+    )
+    actor = entry.user if entry else None
+    await send_server_log(
+        role.guild,
+        "role",
+        "➕ Role Created",
+        f"**{role.name}** (`{role.id}`) was created.",
+        color=discord.Color.green(),
+        fields=[("Action by", f"{actor.mention} (`{actor.id}`)" if actor else "Unknown", False)],
+    )
+    if actor is not None:
+        await check_mass_action(
+            role.guild,
+            actor,
+            "role_structure",
+            "Mass role creation/deletion",
+            f"Created role {role.name} ({role.id})",
+        )
+
+
+@bot.event
+async def on_guild_role_delete(role: discord.Role):
+    entry = await find_recent_audit_entry(
+        role.guild, discord.AuditLogAction.role_delete, target_id=role.id
+    )
+    actor = entry.user if entry else None
+    await send_server_log(
+        role.guild,
+        "role",
+        "➖ Role Deleted",
+        f"**{role.name}** (`{role.id}`) was deleted.",
+        color=discord.Color.red(),
+        fields=[("Action by", f"{actor.mention} (`{actor.id}`)" if actor else "Unknown", False)],
+    )
+    if actor is not None:
+        await check_mass_action(
+            role.guild,
+            actor,
+            "role_structure",
+            "Mass role creation/deletion",
+            f"Deleted role {role.name} ({role.id})",
+        )
+
+
+@bot.event
+async def on_guild_role_update(before: discord.Role, after: discord.Role):
+    changes = []
+    if before.name != after.name:
+        changes.append(f"Name: `{before.name}` → `{after.name}`")
+    if before.permissions != after.permissions:
+        changes.append("Role permissions changed")
+    if before.color != after.color:
+        changes.append(f"Color: `{before.color}` → `{after.color}`")
+    if not changes:
+        return
+    entry = await find_recent_audit_entry(
+        after.guild,
+        discord.AuditLogAction.role_update,
+        target_id=after.id,
+        attempts=1,
+    )
+    actor = entry.user if entry else None
+    await send_server_log(
+        after.guild,
+        "role",
+        "✏️ Role Updated",
+        f"**{after.name}** (`{after.id}`) was updated.",
+        fields=[
+            ("Changes", "\n".join(changes), False),
+            ("Action by", f"{actor.mention} (`{actor.id}`)" if actor else "Unknown", False),
+        ],
+    )
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    before_role_ids = {role.id for role in before.roles}
+    after_role_ids = {role.id for role in after.roles}
+    added_roles = [role for role in after.roles if role.id not in before_role_ids]
+    removed_roles = [role for role in before.roles if role.id not in after_role_ids]
+
+    if added_roles or removed_roles:
+        changes = []
+        if added_roles:
+            changes.append("Added: " + ", ".join(role.name for role in added_roles))
+        if removed_roles:
+            changes.append("Removed: " + ", ".join(role.name for role in removed_roles))
+        entry = await find_recent_audit_entry(
+            after.guild,
+            discord.AuditLogAction.member_role_update,
+            target_id=after.id,
+        )
+        actor = entry.user if entry else None
+        await send_server_log(
+            after.guild,
+            "role",
+            "👤 Member Roles Updated",
+            f"Roles changed for {after.mention} (`{after.id}`).",
+            fields=[
+                ("Changes", "\n".join(changes), False),
+                ("Action by", f"{actor.mention} (`{actor.id}`)" if actor else "Unknown", False),
+            ],
+        )
+        # Role additions never trigger anti-nuke. Only removals count.
+        if removed_roles and actor is not None:
+            await check_mass_action(
+                after.guild,
+                actor,
+                "member_role_remove",
+                "Mass role removals from members",
+                f"Removed {len(removed_roles)} role(s) from {after} ({after.id})",
+                weight=len(removed_roles),
+            )
+
+    if before.display_name != after.display_name:
+        await send_server_log(
+            after.guild,
+            "member",
+            "✏️ Member Name Updated",
+            f"{after.mention} (`{after.id}`) changed display name.",
+            fields=[("Before", before.display_name, True), ("After", after.display_name, True)],
+        )
+
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    if payload.guild_id is None:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    channel = guild.get_channel(payload.channel_id)
+    cached = payload.cached_message
+    author = cached.author if cached else None
+    content = cached.clean_content if cached else "Message was not cached; content unavailable."
+    attachments = "\n".join(item.url for item in cached.attachments) if cached else "None"
+    await send_server_log(
+        guild,
+        "message",
+        "🗑️ Message Deleted",
+        shortened(content, 3500),
+        color=discord.Color.red(),
+        fields=[
+            ("Author", f"{author.mention} (`{author.id}`)" if author else "Unknown", False),
+            ("Channel", channel.mention if channel else f"`{payload.channel_id}`", True),
+            ("Message ID", str(payload.message_id), True),
+            ("Attachments", attachments, False),
+        ],
+    )
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent):
+    if payload.guild_id is None:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    channel = guild.get_channel(payload.channel_id)
+    await send_server_log(
+        guild,
+        "message",
+        "🧹 Messages Bulk Deleted",
+        f"**{len(payload.message_ids)}** messages were deleted.",
+        color=discord.Color.red(),
+        fields=[
+            ("Channel", channel.mention if channel else f"`{payload.channel_id}`", True),
+            ("Message IDs", shortened(", ".join(str(item) for item in payload.message_ids)), False),
+        ],
+    )
+
+
+@bot.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    if payload.guild_id is None or "content" not in payload.data:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    channel = guild.get_channel(payload.channel_id)
+    cached = payload.cached_message
+    before_content = cached.clean_content if cached else "Message was not cached."
+    after_content = payload.data.get("content") or "[empty message]"
+    if cached is not None and cached.content == after_content:
+        return
+    author_id = payload.data.get("author", {}).get("id")
+    author_text = f"<@{author_id}> (`{author_id}`)" if author_id else "Unknown"
+    await send_server_log(
+        guild,
+        "message",
+        "✏️ Message Edited",
+        f"A message was edited in {channel.mention if channel else f'`{payload.channel_id}`'}.",
+        color=discord.Color.gold(),
+        fields=[
+            ("Author", author_text, False),
+            ("Before", before_content, False),
+            ("After", after_content, False),
+            ("Message ID", str(payload.message_id), True),
+        ],
+    )
+
+
+async def log_reaction_event(
+    payload: discord.RawReactionActionEvent, action_name: str
+) -> None:
+    if payload.guild_id is None:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    channel = guild.get_channel(payload.channel_id)
+    member = payload.member or guild.get_member(payload.user_id)
+    user_text = f"{member.mention} (`{member.id}`)" if member else f"`{payload.user_id}`"
+    message_link = (
+        f"https://discord.com/channels/{guild.id}/{payload.channel_id}/{payload.message_id}"
+    )
+    await send_server_log(
+        guild,
+        "reaction",
+        f"{action_name} Reaction",
+        f"{user_text} {action_name.lower()} `{payload.emoji}`.",
+        color=discord.Color.green() if action_name == "Added" else discord.Color.red(),
+        fields=[
+            ("Channel", channel.mention if channel else f"`{payload.channel_id}`", True),
+            ("Message", f"[Open message]({message_link})", True),
+        ],
+    )
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    await log_reaction_event(payload, "Added")
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    await log_reaction_event(payload, "Removed")
+
+
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
+):
+    if before.channel == after.channel:
+        return
+    if before.channel is None:
+        action = f"joined {after.channel.mention}"
+        title = "🔊 Voice Channel Joined"
+        color = discord.Color.green()
+    elif after.channel is None:
+        action = f"left {before.channel.mention}"
+        title = "🔇 Voice Channel Left"
+        color = discord.Color.red()
+    else:
+        action = f"moved from {before.channel.mention} to {after.channel.mention}"
+        title = "🔁 Voice Channel Moved"
+        color = discord.Color.blurple()
+    await send_server_log(
+        member.guild,
+        "voice",
+        title,
+        f"{member.mention} (`{member.id}`) {action}.",
+        color=color,
+    )
+
+
+@bot.event
+async def on_guild_update(before: discord.Guild, after: discord.Guild):
+    changes = []
+    if before.name != after.name:
+        changes.append(f"Name: `{before.name}` → `{after.name}`")
+    if before.verification_level != after.verification_level:
+        changes.append(
+            f"Verification: `{before.verification_level}` → `{after.verification_level}`"
+        )
+    if before.icon != after.icon:
+        changes.append("Server icon changed")
+    if not changes:
+        return
+    await send_server_log(
+        after,
+        "server",
+        "⚙️ Server Updated",
+        "Server settings were changed.",
+        color=discord.Color.gold(),
+        fields=[("Changes", "\n".join(changes), False)],
+    )
+
+
+@bot.event
+async def on_invite_create(invite: discord.Invite):
+    if invite.guild is None:
+        return
+    await send_server_log(
+        invite.guild,
+        "server",
+        "🔗 Invite Created",
+        f"Invite `{invite.code}` was created.",
+        color=discord.Color.green(),
+        fields=[
+            ("Creator", f"{invite.inviter.mention} (`{invite.inviter.id}`)" if invite.inviter else "Unknown", False),
+            ("Channel", invite.channel.mention if invite.channel else "Unknown", True),
+        ],
+    )
+
+
+@bot.event
+async def on_invite_delete(invite: discord.Invite):
+    if invite.guild is None:
+        return
+    await send_server_log(
+        invite.guild,
+        "server",
+        "🗑️ Invite Deleted",
+        f"Invite `{invite.code}` was deleted or expired.",
+        color=discord.Color.red(),
+    )
 
 
 @bot.hybrid_command()
@@ -1075,6 +1913,133 @@ async def setupmembercount(ctx: commands.Context):
 
 @bot.hybrid_command()
 @commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(manage_channels=True)
+async def setuplogs(ctx: commands.Context):
+    """Create every private server event log channel."""
+    if ctx.interaction is not None:
+        await ctx.defer()
+    try:
+        channels = await ensure_server_logging(ctx.guild)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        await ctx.send(f"I could not create the server logs: `{error}`")
+        return
+    await ctx.send(
+        "✅ Private server logs are ready:\n" + "\n".join(channel.mention for channel in channels)
+    )
+
+
+@bot.hybrid_group(name="antinuke", fallback="status")
+@commands.has_permissions(administrator=True)
+async def antinuke(ctx: commands.Context):
+    """Show the current Harps Community anti-nuke status."""
+    whitelist_role = discord.utils.get(
+        ctx.guild.roles, name=ANTINUKE_WHITELIST_ROLE_NAME
+    )
+    log_category = discord.utils.get(
+        ctx.guild.categories, name=SERVER_LOG_CATEGORY_NAME
+    )
+    embed = discord.Embed(
+        title="🛡️ Harps Community Anti-Nuke",
+        description="Anti-nuke monitoring is **enabled** whenever the bot is online.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Channel deletion", value="Ban after the first confirmed deletion", inline=False)
+    embed.add_field(
+        name="Mass-action threshold",
+        value=f"{ANTINUKE_MASS_THRESHOLD} actions within {ANTINUKE_WINDOW_SECONDS} seconds",
+        inline=False,
+    )
+    embed.add_field(
+        name="Protected actions",
+        value="Role creates/deletes, role removals, kicks, bans, prunes and unauthorized bot additions",
+        inline=False,
+    )
+    embed.add_field(
+        name="Whitelist role",
+        value=whitelist_role.mention if whitelist_role else "Not created",
+        inline=True,
+    )
+    embed.add_field(
+        name="Log category",
+        value=log_category.name if log_category else "Not created",
+        inline=True,
+    )
+    embed.set_footer(text="Normal joins, voluntary leaves and role additions never trigger punishment")
+    await ctx.send(embed=embed)
+
+
+@antinuke.command(name="setup")
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(
+    manage_channels=True, manage_roles=True, ban_members=True, view_audit_log=True
+)
+async def antinuke_setup(ctx: commands.Context):
+    """Create the whitelist role and all anti-nuke/server logs."""
+    if ctx.interaction is not None:
+        await ctx.defer()
+    try:
+        role = await ensure_antinuke_whitelist_role(ctx.guild)
+        channels = await ensure_server_logging(ctx.guild)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        await ctx.send(f"Anti-nuke setup failed: `{error}`")
+        return
+    await ctx.send(
+        f"✅ Anti-nuke is ready.\nWhitelist: {role.mention}\n"
+        f"Log channels: **{len(channels)}**"
+    )
+
+
+@antinuke.command(name="whitelist")
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(manage_roles=True)
+async def antinuke_whitelist(ctx: commands.Context, member: discord.Member):
+    """Exempt a trusted member or bot from automatic anti-nuke punishment."""
+    role = await ensure_antinuke_whitelist_role(ctx.guild)
+    if ctx.guild.me is None or role >= ctx.guild.me.top_role:
+        await ctx.send(
+            f"Move my bot role above `{ANTINUKE_WHITELIST_ROLE_NAME}` first."
+        )
+        return
+    if role in member.roles:
+        await ctx.send(f"{member.mention} is already whitelisted.")
+        return
+    await member.add_roles(
+        role, reason=f"Anti-nuke whitelist added by {ctx.author} ({ctx.author.id})"
+    )
+    await ctx.send(f"✅ {member.mention} is now protected by the anti-nuke whitelist.")
+    await send_server_log(
+        ctx.guild,
+        "antinuke",
+        "🛡️ Whitelist Added",
+        f"{member.mention} (`{member.id}`) was whitelisted by {ctx.author.mention} (`{ctx.author.id}`).",
+        color=discord.Color.green(),
+    )
+
+
+@antinuke.command(name="unwhitelist")
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(manage_roles=True)
+async def antinuke_unwhitelist(ctx: commands.Context, member: discord.Member):
+    """Remove a member or bot from the anti-nuke whitelist."""
+    role = discord.utils.get(ctx.guild.roles, name=ANTINUKE_WHITELIST_ROLE_NAME)
+    if role is None or role not in member.roles:
+        await ctx.send(f"{member.mention} is not whitelisted.")
+        return
+    await member.remove_roles(
+        role, reason=f"Anti-nuke whitelist removed by {ctx.author} ({ctx.author.id})"
+    )
+    await ctx.send(f"✅ {member.mention} was removed from the anti-nuke whitelist.")
+    await send_server_log(
+        ctx.guild,
+        "antinuke",
+        "⚠️ Whitelist Removed",
+        f"{member.mention} (`{member.id}`) was unwhitelisted by {ctx.author.mention} (`{ctx.author.id}`).",
+        color=discord.Color.orange(),
+    )
+
+
+@bot.hybrid_command()
+@commands.has_permissions(administrator=True)
 @commands.bot_has_permissions(manage_roles=True)
 async def syncautorole(ctx: commands.Context):
     """Give the Regulars role to every current human member who is missing it."""
@@ -1205,6 +2170,11 @@ async def ticketpanel(ctx: commands.Context):
 
 @ticketpanel.error
 @rules.error
+@antinuke_unwhitelist.error
+@antinuke_whitelist.error
+@antinuke_setup.error
+@antinuke.error
+@setuplogs.error
 @syncautorole.error
 @setupmodlogs.error
 @setupmembercount.error
