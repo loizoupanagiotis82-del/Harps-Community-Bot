@@ -759,14 +759,71 @@ async def send_welcome(member: discord.Member) -> bool:
     if channel is None:
         return False
 
+    rules_channel = discord.utils.get(
+        member.guild.text_channels, name=RULES_CHANNEL_NAME
+    )
+    member_total = member.guild.member_count or len(member.guild.members)
+    rules_destination = (
+        rules_channel.mention
+        if rules_channel is not None
+        else f"the `{RULES_CHANNEL_NAME}` channel"
+    )
     embed = discord.Embed(
-        title="👋 Welcome to Harps Community!",
-        description=f"Welcome {member.mention}! Hope you enjoy your stay.",
-        color=discord.Color.blue(),
+        title="✨ Welcome to Harps Community!",
+        description=(
+            f"Hey {member.mention}, we’re excited to have you here! 🎉\n\n"
+            f"You are officially member **#{member_total:,}** of **{member.guild.name}**. "
+            "Take a moment to get comfortable, meet the community and enjoy your stay."
+        ),
+        color=discord.Color.from_rgb(255, 112, 67),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="📚 Start with the rules",
+        value=(
+            f"Please read {rules_destination} before chatting. "
+            "The button below will take you straight there."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="💬 Join the community",
+        value="Say hello, join the conversations and make yourself at home!",
+        inline=False,
+    )
+    embed.add_field(
+        name="🎫 Need help?",
+        value="Open a support ticket at any time and the Harps Community team will assist you.",
+        inline=False,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=f"👥 Member #{member.guild.member_count}")
-    await channel.send(embed=embed)
+    if member.guild.icon is not None:
+        embed.set_author(
+            name=member.guild.name,
+            icon_url=member.guild.icon.url,
+        )
+    if member.guild.banner is not None:
+        embed.set_image(url=member.guild.banner.url)
+    embed.set_footer(
+        text=f"Harps Community • Member #{member_total:,} • Welcome aboard!"
+    )
+
+    view = None
+    if rules_channel is not None:
+        view = discord.ui.View()
+        view.add_item(
+            discord.ui.Button(
+                label="Read the Rules",
+                emoji="📚",
+                style=discord.ButtonStyle.link,
+                url=(
+                    f"https://discord.com/channels/{member.guild.id}/"
+                    f"{rules_channel.id}"
+                ),
+            )
+        )
+
+    await channel.send(content=f"🎉 {member.mention}", embed=embed, view=view)
     return True
 
 
