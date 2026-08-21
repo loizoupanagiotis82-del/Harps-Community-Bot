@@ -1463,11 +1463,25 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         return
     channel = guild.get_channel(payload.channel_id)
     cached = payload.cached_message
+    author_data = payload.data.get("author", {})
+    author_id = author_data.get("id")
+    is_bot_message = bool(author_data.get("bot")) or (
+        cached is not None and cached.author.bot
+    )
+    if bot.user is not None and author_id == str(bot.user.id):
+        is_bot_message = True
+    if is_bot_message:
+        return
+
     before_content = cached.clean_content if cached else "Message was not cached."
-    after_content = payload.data.get("content") or "[empty message]"
+    raw_after_content = payload.data.get("content")
+    # Discord can emit empty raw updates for embed/link-preview changes. They
+    # are not actual user text edits and should not pollute message-logs.
+    if cached is None and not raw_after_content:
+        return
+    after_content = raw_after_content or "[empty message]"
     if cached is not None and cached.content == after_content:
         return
-    author_id = payload.data.get("author", {}).get("id")
     author_text = f"<@{author_id}> (`{author_id}`)" if author_id else "Unknown"
     await send_server_log(
         guild,
