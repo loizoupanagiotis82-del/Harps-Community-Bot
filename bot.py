@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import re
+from datetime import timedelta
 
 import discord
 from discord.ext import commands
@@ -24,6 +25,14 @@ MEMBER_COUNT_CHANNEL_PREFIX = "👥 Members:"
 WELCOME_CHANNEL_NAME = "📜・welcome"
 GOODBYE_CHANNEL_NAME = "📜・goodbye"
 RULES_CHANNEL_NAME = "📚server-rules"
+MOD_LOG_CATEGORY_NAME = "🛡️ MODERATION LOGS"
+
+MOD_LOG_CHANNELS = {
+    "kick": "kick-logs",
+    "ban": "ban-logs",
+    "clear": "cleared-logs",
+    "server": "server-logs",
+}
 
 SERVER_RULES = """• Απαγορεύονται οι προσωπικές επιθέσεις, ο σεξισμός, ο ρατσισμός και οτιδήποτε σχετικό και οποιαδήποτε υποστήριξη των παραπάνω.
 
@@ -99,6 +108,106 @@ def staff_overwrites(guild: discord.Guild) -> dict:
                 attach_files=True,
             )
     return overwrites
+
+
+async def get_mod_log_channel(
+    guild: discord.Guild, log_type: str, *, create_if_missing: bool = True
+) -> discord.TextChannel | None:
+    channel_name = MOD_LOG_CHANNELS.get(log_type, MOD_LOG_CHANNELS["server"])
+    category = discord.utils.get(guild.categories, name=MOD_LOG_CATEGORY_NAME)
+    if category is None:
+        if not create_if_missing:
+            return None
+        category = await guild.create_category(
+            MOD_LOG_CATEGORY_NAME,
+            overwrites=staff_overwrites(guild),
+            reason="Harps Community moderation logging setup",
+        )
+
+    channel = discord.utils.get(category.text_channels, name=channel_name)
+    if channel is None and create_if_missing:
+        channel = await guild.create_text_channel(
+            channel_name,
+            category=category,
+            overwrites=staff_overwrites(guild),
+            topic=f"Harps Community {channel_name.replace('-', ' ')}",
+            reason="Harps Community moderation logging setup",
+        )
+    return channel
+
+
+async def send_mod_log(
+    guild: discord.Guild,
+    log_type: str,
+    title: str,
+    moderator: discord.Member,
+    *,
+    target: discord.Member | discord.User | None = None,
+    reason: str = "No reason provided",
+    details: str | None = None,
+    color: discord.Color = discord.Color.orange(),
+) -> bool:
+    try:
+        channel = await get_mod_log_channel(guild, log_type)
+        if channel is None:
+            return False
+        embed = discord.Embed(
+            title=title,
+            color=color,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(
+            name="Moderator",
+            value=f"{moderator.mention}\n`{moderator.id}`",
+            inline=True,
+        )
+        if target is not None:
+            embed.add_field(
+                name="Member",
+                value=f"{target.mention}\n`{target.id}`",
+                inline=True,
+            )
+        embed.add_field(name="Reason", value=reason[:1024], inline=False)
+        if details:
+            embed.add_field(name="Details", value=details[:1024], inline=False)
+        embed.set_footer(text="Harps Community • Moderation Log")
+        await channel.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"Could not save moderation log in {guild.name}: {error}")
+        return False
+
+
+def moderation_block_reason(
+    ctx: commands.Context, target: discord.Member
+) -> str | None:
+    if target == ctx.author:
+        return "You cannot use this moderation command on yourself."
+    if target == ctx.guild.owner:
+        return "The server owner cannot be moderated."
+    if target == ctx.guild.me:
+        return "I cannot moderate myself."
+    if ctx.author != ctx.guild.owner and target.top_role >= ctx.author.top_role:
+        return "You cannot moderate a member with an equal or higher role than yours."
+    if ctx.guild.me is None or target.top_role >= ctx.guild.me.top_role:
+        return "My role must be higher than the member's highest role."
+    return None
+
+
+def parse_timeout_duration(value: str) -> timedelta | None:
+    match = re.fullmatch(r"(\d+)([mhd])", value.lower())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2)
+    duration = {
+        "m": timedelta(minutes=amount),
+        "h": timedelta(hours=amount),
+        "d": timedelta(days=amount),
+    }[unit]
+    if duration <= timedelta(0) or duration > timedelta(days=28):
+        return None
+    return duration
 
 
 async def update_member_count(
@@ -552,6 +661,16 @@ async def on_member_join(member: discord.Member):
         await update_member_count(member.guild)
     except (discord.Forbidden, discord.HTTPException) as error:
         print(f"Could not update member counter in {member.guild.name}: {error}")
+    if member.guild.me is not None:
+        await send_mod_log(
+            member.guild,
+            "server",
+            "📥 Member Joined",
+            member.guild.me,
+            target=member,
+            reason="Member joined the server",
+            color=discord.Color.green(),
+        )
 
 
 @bot.event
@@ -561,6 +680,16 @@ async def on_member_remove(member: discord.Member):
         await update_member_count(member.guild)
     except (discord.Forbidden, discord.HTTPException) as error:
         print(f"Could not update member counter in {member.guild.name}: {error}")
+    if member.guild.me is not None:
+        await send_mod_log(
+            member.guild,
+            "server",
+            "📤 Member Left",
+            member.guild.me,
+            target=member,
+            reason="Member left or was removed from the server",
+            color=discord.Color.red(),
+        )
 
 
 @bot.command()
@@ -577,6 +706,273 @@ async def membercount(ctx: commands.Context):
         color=discord.Color.blurple(),
     )
     await ctx.send(embed=embed)
+
+
+@bot.command(aliases=["purge"])
+@commands.has_permissions(manage_messages=True)
+@commands.bot_has_permissions(manage_messages=True)
+@commands.cooldown(1, 3, commands.BucketType.channel)
+async def clear(ctx: commands.Context, amount: int = 10):
+    if amount < 1 or amount > 100:
+        await ctx.send("Choose an amount between 1 and 100.", delete_after=5)
+        return
+    deleted = await ctx.channel.purge(
+        limit=amount + 1, check=lambda message: not message.pinned
+    )
+    cleared_count = max(len(deleted) - 1, 0)
+    confirmation = await ctx.send(f"🧹 Cleared **{cleared_count}** messages.")
+    await send_mod_log(
+        ctx.guild,
+        "clear",
+        "🧹 Messages Cleared",
+        ctx.author,
+        reason="Clear command used",
+        details=f"Channel: {ctx.channel.mention}\nMessages cleared: {cleared_count}",
+        color=discord.Color.gold(),
+    )
+    await asyncio.sleep(5)
+    try:
+        await confirmation.delete()
+    except discord.NotFound:
+        pass
+
+
+@bot.command()
+@commands.has_permissions(kick_members=True)
+@commands.bot_has_permissions(kick_members=True)
+async def kick(
+    ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"
+):
+    blocked = moderation_block_reason(ctx, member)
+    if blocked:
+        await ctx.send(blocked)
+        return
+    await member.kick(reason=f"{reason} | Moderator: {ctx.author} ({ctx.author.id})")
+    await ctx.send(f"👢 {member} was kicked. Reason: **{reason}**")
+    await send_mod_log(
+        ctx.guild,
+        "kick",
+        "👢 Member Kicked",
+        ctx.author,
+        target=member,
+        reason=reason,
+        color=discord.Color.orange(),
+    )
+
+
+@bot.command()
+@commands.has_permissions(ban_members=True)
+@commands.bot_has_permissions(ban_members=True)
+async def ban(
+    ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"
+):
+    blocked = moderation_block_reason(ctx, member)
+    if blocked:
+        await ctx.send(blocked)
+        return
+    await ctx.guild.ban(
+        member,
+        reason=f"{reason} | Moderator: {ctx.author} ({ctx.author.id})",
+        delete_message_seconds=0,
+    )
+    await ctx.send(f"🔨 {member} was banned. Reason: **{reason}**")
+    await send_mod_log(
+        ctx.guild,
+        "ban",
+        "🔨 Member Banned",
+        ctx.author,
+        target=member,
+        reason=reason,
+        color=discord.Color.red(),
+    )
+
+
+@bot.command()
+@commands.has_permissions(ban_members=True)
+@commands.bot_has_permissions(ban_members=True)
+async def unban(
+    ctx: commands.Context, user_id: int, *, reason: str = "No reason provided"
+):
+    try:
+        user = (await ctx.guild.fetch_ban(discord.Object(id=user_id))).user
+    except discord.NotFound:
+        await ctx.send("That user ID is not currently banned.")
+        return
+    await ctx.guild.unban(
+        user, reason=f"{reason} | Moderator: {ctx.author} ({ctx.author.id})"
+    )
+    await ctx.send(f"✅ {user} was unbanned. Reason: **{reason}**")
+    await send_mod_log(
+        ctx.guild,
+        "ban",
+        "✅ Member Unbanned",
+        ctx.author,
+        target=user,
+        reason=reason,
+        color=discord.Color.green(),
+    )
+
+
+@bot.command(aliases=["mute"])
+@commands.has_permissions(moderate_members=True)
+@commands.bot_has_permissions(moderate_members=True)
+async def timeout(
+    ctx: commands.Context,
+    member: discord.Member,
+    duration: str,
+    *,
+    reason: str = "No reason provided",
+):
+    blocked = moderation_block_reason(ctx, member)
+    if blocked:
+        await ctx.send(blocked)
+        return
+    parsed_duration = parse_timeout_duration(duration)
+    if parsed_duration is None:
+        await ctx.send("Use a duration such as `10m`, `2h`, or `1d` (maximum 28 days).")
+        return
+    until = discord.utils.utcnow() + parsed_duration
+    await member.timeout(
+        until, reason=f"{reason} | Moderator: {ctx.author} ({ctx.author.id})"
+    )
+    await ctx.send(
+        f"⏳ {member.mention} was timed out until "
+        f"{discord.utils.format_dt(until, style='F')}."
+    )
+    await send_mod_log(
+        ctx.guild,
+        "server",
+        "⏳ Member Timed Out",
+        ctx.author,
+        target=member,
+        reason=reason,
+        details=f"Duration: {duration}\nEnds: {discord.utils.format_dt(until, style='F')}",
+    )
+
+
+@bot.command(aliases=["unmute"])
+@commands.has_permissions(moderate_members=True)
+@commands.bot_has_permissions(moderate_members=True)
+async def untimeout(
+    ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"
+):
+    blocked = moderation_block_reason(ctx, member)
+    if blocked:
+        await ctx.send(blocked)
+        return
+    await member.timeout(
+        None, reason=f"{reason} | Moderator: {ctx.author} ({ctx.author.id})"
+    )
+    await ctx.send(f"✅ Timeout removed from {member.mention}.")
+    await send_mod_log(
+        ctx.guild,
+        "server",
+        "✅ Member Timeout Removed",
+        ctx.author,
+        target=member,
+        reason=reason,
+        color=discord.Color.green(),
+    )
+
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def warn(
+    ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"
+):
+    blocked = moderation_block_reason(ctx, member)
+    if blocked:
+        await ctx.send(blocked)
+        return
+    try:
+        await member.send(
+            f"⚠️ You received a warning in **{ctx.guild.name}**.\nReason: {reason}"
+        )
+        dm_status = "Warning delivered by DM"
+    except discord.Forbidden:
+        dm_status = "DM could not be delivered"
+    await ctx.send(f"⚠️ {member.mention} was warned. Reason: **{reason}**")
+    await send_mod_log(
+        ctx.guild,
+        "server",
+        "⚠️ Member Warned",
+        ctx.author,
+        target=member,
+        reason=reason,
+        details=dm_status,
+        color=discord.Color.gold(),
+    )
+
+
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+@commands.bot_has_permissions(manage_channels=True)
+async def lock(ctx: commands.Context):
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    overwrite.send_messages = False
+    await ctx.channel.set_permissions(
+        ctx.guild.default_role,
+        overwrite=overwrite,
+        reason=f"Channel locked by {ctx.author} ({ctx.author.id})",
+    )
+    await ctx.send("🔒 This channel has been locked.")
+    await send_mod_log(
+        ctx.guild,
+        "server",
+        "🔒 Channel Locked",
+        ctx.author,
+        reason="Lock command used",
+        details=f"Channel: {ctx.channel.mention}",
+    )
+
+
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+@commands.bot_has_permissions(manage_channels=True)
+async def unlock(ctx: commands.Context):
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    overwrite.send_messages = None
+    await ctx.channel.set_permissions(
+        ctx.guild.default_role,
+        overwrite=overwrite,
+        reason=f"Channel unlocked by {ctx.author} ({ctx.author.id})",
+    )
+    await ctx.send("🔓 This channel has been unlocked.")
+    await send_mod_log(
+        ctx.guild,
+        "server",
+        "🔓 Channel Unlocked",
+        ctx.author,
+        reason="Unlock command used",
+        details=f"Channel: {ctx.channel.mention}",
+        color=discord.Color.green(),
+    )
+
+
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+@commands.bot_has_permissions(manage_channels=True)
+async def slowmode(ctx: commands.Context, seconds: int = 0):
+    if seconds < 0 or seconds > 21600:
+        await ctx.send("Slowmode must be between 0 and 21,600 seconds.")
+        return
+    await ctx.channel.edit(
+        slowmode_delay=seconds,
+        reason=f"Slowmode changed by {ctx.author} ({ctx.author.id})",
+    )
+    await ctx.send(
+        "✅ Slowmode disabled."
+        if seconds == 0
+        else f"🐢 Slowmode set to **{seconds} seconds**."
+    )
+    await send_mod_log(
+        ctx.guild,
+        "server",
+        "🐢 Slowmode Updated",
+        ctx.author,
+        reason="Slowmode command used",
+        details=f"Channel: {ctx.channel.mention}\nDelay: {seconds} seconds",
+    )
 
 
 @bot.command()
@@ -604,6 +1000,63 @@ async def setupmembercount(ctx: commands.Context):
         )
         return
     await ctx.send(f"✅ Live member counter ready: {channel.mention}")
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setupmodlogs(ctx: commands.Context):
+    try:
+        created_channels = []
+        for log_type in MOD_LOG_CHANNELS:
+            channel = await get_mod_log_channel(ctx.guild, log_type)
+            if channel is not None:
+                created_channels.append(channel.mention)
+    except discord.Forbidden:
+        await ctx.send(
+            "I could not create the log category. Please give me Manage Channels permission."
+        )
+        return
+    await ctx.send(
+        "✅ Moderation logs are ready:\n" + "\n".join(created_channels)
+    )
+
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def modhelp(ctx: commands.Context):
+    embed = discord.Embed(
+        title="🛡️ Harps Community Moderation Commands",
+        description="Only members with the required Discord permissions can use these commands.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="Member moderation",
+        value=(
+            "`!warn @member reason`\n"
+            "`!timeout @member 10m reason`\n"
+            "`!untimeout @member reason`\n"
+            "`!kick @member reason`\n"
+            "`!ban @member reason`\n"
+            "`!unban USER_ID reason`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Channel moderation",
+        value=(
+            "`!clear 10` — clears up to 100 messages\n"
+            "`!lock` / `!unlock`\n"
+            "`!slowmode 10` — use 0 to disable"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Setup",
+        value="`!setupmodlogs` — creates the private moderation log category",
+        inline=False,
+    )
+    embed.set_footer(text="Timeout units: m = minutes, h = hours, d = days")
+    await ctx.send(embed=embed)
 
 
 @bot.command()
@@ -652,6 +1105,7 @@ async def ticketpanel(ctx: commands.Context):
 
 @ticketpanel.error
 @rules.error
+@setupmodlogs.error
 @setupmembercount.error
 @testwelcome.error
 @testgoodbye.error
@@ -660,6 +1114,40 @@ async def admin_command_error(ctx: commands.Context, error: commands.CommandErro
         await ctx.send("You need the Administrator permission to use this command.")
         return
     raise error
+
+
+@clear.error
+@kick.error
+@ban.error
+@unban.error
+@timeout.error
+@untimeout.error
+@warn.error
+@lock.error
+@unlock.error
+@slowmode.error
+@modhelp.error
+async def moderation_command_error(
+    ctx: commands.Context, error: commands.CommandError
+):
+    if isinstance(error, commands.MissingPermissions):
+        permissions = ", ".join(error.missing_permissions)
+        await ctx.send(f"You do not have the required permission(s): `{permissions}`.")
+    elif isinstance(error, commands.BotMissingPermissions):
+        permissions = ", ".join(error.missing_permissions)
+        await ctx.send(f"I need the following permission(s): `{permissions}`.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"Missing required value: `{error.param.name}`. Use `!modhelp` for examples.")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("I could not find that member. Mention them or use their user ID.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("One of those values is invalid. Use `!modhelp` for examples.")
+    elif isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"Please wait {error.retry_after:.1f} seconds before using that again.")
+    elif isinstance(error, commands.NoPrivateMessage):
+        await ctx.send("This command can only be used inside the server.")
+    else:
+        raise error
 
 
 if not TOKEN:
