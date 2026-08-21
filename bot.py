@@ -117,6 +117,40 @@ LFG_TEAM_SIZES = {
     "10": "Custom Team",
 }
 
+LFG_GAME_EMOJIS = {
+    "valorant": "🎯",
+    "cs2": "💥",
+    "cod": "🪖",
+    "fortnite": "🏝️",
+    "rocket_league": "🚗",
+    "minecraft": "⛏️",
+    "roblox": "🧱",
+    "apex": "🏆",
+    "overwatch_2": "⚡",
+    "rainbow_six": "🛡️",
+    "gta_online": "🌆",
+    "ea_fc": "⚽",
+}
+
+LFG_GAME_COLORS = {
+    "valorant": 0xFF4655,
+    "cs2": 0xF2A900,
+    "cod": 0x70A288,
+    "fortnite": 0x7B5CFA,
+    "rocket_league": 0x1677FF,
+    "minecraft": 0x56A447,
+    "roblox": 0xE2231A,
+    "apex": 0xDA292A,
+    "overwatch_2": 0xF99E1A,
+    "rainbow_six": 0x2F3136,
+    "gta_online": 0x4FB06D,
+    "ea_fc": 0x31E981,
+}
+
+HARPS_PRIMARY_COLOR = discord.Color.from_rgb(255, 91, 105)
+HARPS_ACCENT_COLOR = discord.Color.from_rgb(124, 77, 255)
+HARPS_GOLD_COLOR = discord.Color.from_rgb(255, 193, 7)
+
 # IDs placed here are always trusted, including bots that are not in the server yet.
 ANTINUKE_WHITELIST_IDS: set[int] = set()
 
@@ -1155,6 +1189,9 @@ async def send_welcome(member: discord.Member) -> bool:
     rules_channel = discord.utils.get(
         member.guild.text_channels, name=RULES_CHANNEL_NAME
     )
+    lfg_channel = discord.utils.get(
+        member.guild.text_channels, name=LFG_CREATE_CHANNEL_NAME
+    )
     member_total = member.guild.member_count or len(member.guild.members)
     rules_destination = (
         rules_channel.mention
@@ -1162,31 +1199,37 @@ async def send_welcome(member: discord.Member) -> bool:
         else f"the `{RULES_CHANNEL_NAME}` channel"
     )
     embed = discord.Embed(
-        title="✨ Welcome to Harps Community!",
+        title="🎉 Welcome to Harps Community!",
         description=(
-            f"Hey {member.mention}, we’re excited to have you here! 🎉\n\n"
-            f"You are officially member **#{member_total:,}** of **{member.guild.name}**. "
-            "Take a moment to get comfortable, meet the community and enjoy your stay."
+            f"Hey {member.mention} — you just joined the party!\n\n"
+            f"You are member **#{member_total:,}** of **{member.guild.name}**, a place "
+            "to meet people, build teams, discover opportunities and create great moments."
         ),
-        color=discord.Color.from_rgb(255, 112, 67),
+        color=HARPS_PRIMARY_COLOR,
         timestamp=discord.utils.utcnow(),
     )
     embed.add_field(
-        name="📚 Start with the rules",
+        name="🚀 Your first three moves",
         value=(
-            f"Please read {rules_destination} before chatting. "
-            "The button below will take you straight there."
+            f"**1.** Read {rules_destination}\n"
+            "**2.** Pick your community roles\n"
+            "**3.** Introduce yourself and find your next squad"
         ),
         inline=False,
     )
     embed.add_field(
-        name="💬 Join the community",
-        value="Say hello, join the conversations and make yourself at home!",
-        inline=False,
+        name="🎮 Find your people",
+        value="Create a Duo, Trio, Squad or full team with the interactive LFG system.",
+        inline=True,
     )
     embed.add_field(
-        name="🎫 Need help?",
-        value="Open a support ticket at any time and the Harps Community team will assist you.",
+        name="🤝 Grow with us",
+        value="Partnerships, sponsors and new community ideas are always welcome through support.",
+        inline=True,
+    )
+    embed.add_field(
+        name="💬 Make some noise",
+        value="Jump into a conversation, be respectful and make Harps Community yours.",
         inline=False,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
@@ -1202,12 +1245,11 @@ async def send_welcome(member: discord.Member) -> bool:
         text=f"Harps Community • Member #{member_total:,} • Welcome aboard!"
     )
 
-    view = None
+    view = discord.ui.View()
     if rules_channel is not None:
-        view = discord.ui.View()
         view.add_item(
             discord.ui.Button(
-                label="Read the Rules",
+                label="Start Here • Rules",
                 emoji="📚",
                 style=discord.ButtonStyle.link,
                 url=(
@@ -1216,8 +1258,24 @@ async def send_welcome(member: discord.Member) -> bool:
                 ),
             )
         )
+    if lfg_channel is not None:
+        view.add_item(
+            discord.ui.Button(
+                label="Find a Team",
+                emoji="🎮",
+                style=discord.ButtonStyle.link,
+                url=(
+                    f"https://discord.com/channels/{member.guild.id}/"
+                    f"{lfg_channel.id}"
+                ),
+            )
+        )
 
-    await channel.send(content=f"🎉 {member.mention}", embed=embed, view=view)
+    await channel.send(
+        content=f"🎉 {member.mention}",
+        embed=embed,
+        view=view if view.children else None,
+    )
     return True
 
 
@@ -1233,20 +1291,20 @@ async def send_goodbye(member: discord.Member) -> bool:
         time_with_server = f"{days} day{'s' if days != 1 else ''}"
 
     embed = discord.Embed(
-        title="🌙 Until Next Time...",
+        title="🌙 GG for Now...",
         description=(
             f"**{member.display_name}** has left **{member.guild.name}**.\n\n"
-            "Thank you for being part of Harps Community. The door is always open, "
-            "and we hope our paths cross again someday. 👋"
+            "Every player leaves a mark on the community. Thanks for the conversations, "
+            "teams and moments—you will always have a place here. 👋"
         ),
-        color=discord.Color.from_rgb(126, 87, 194),
+        color=HARPS_ACCENT_COLOR,
         timestamp=discord.utils.utcnow(),
     )
     embed.add_field(name="🕒 Time with us", value=time_with_server, inline=True)
     embed.add_field(name="👥 Members remaining", value=f"{member_total:,}", inline=True)
     embed.add_field(
-        name="💜 From Harps Community",
-        value="Thank you for the memories, conversations and moments you shared with us.",
+        name="💜 The door stays open",
+        value="Your next squad, conversation or comeback could be waiting whenever you return.",
         inline=False,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
@@ -1255,7 +1313,7 @@ async def send_goodbye(member: discord.Member) -> bool:
     banner_url = server_banner_url(member.guild)
     if banner_url is not None:
         embed.set_image(url=banner_url)
-    embed.set_footer(text="Harps Community • Farewell and take care!")
+    embed.set_footer(text="Harps Community • Once part of the community, always remembered")
     await channel.send(embed=embed)
     return True
 
@@ -1613,10 +1671,12 @@ class BoostPanelView(discord.ui.View):
         embed = discord.Embed(
             title="🚀 Ready to Boost Harps Community?",
             description=(
-                "Thank you for supporting our community! Discord requires boosts to be "
-                "confirmed from its built-in **Server Boost** screen."
+                "You are one step away from helping Harps level up. Every boost makes "
+                "the community more expressive, polished and fun for everyone. 💜\n\n"
+                "Discord requires the final confirmation from its built-in "
+                "**Server Boost** screen."
             ),
-            color=discord.Color.blue(),
+            color=HARPS_ACCENT_COLOR,
         )
         embed.add_field(
             name="🖥️ Desktop / Browser",
@@ -1634,6 +1694,9 @@ class BoostPanelView(discord.ui.View):
             ),
             inline=False,
         )
+        if interaction.guild.icon is not None:
+            embed.set_thumbnail(url=interaction.guild.icon.url)
+        embed.set_footer(text="Harps Community • Thank you for powering our next level")
         await interaction.response.send_message(
             embed=embed, view=link_view, ephemeral=True
         )
@@ -1823,21 +1886,33 @@ async def create_ticket(
             ticket_creation_locks.pop(lock_key, None)
 
         embed = discord.Embed(
-            title="🎫 Harps Community Support",
+            title="🎫 Your Private Support Space",
             description=(
-                f"Welcome, {interaction.user.mention}!\n\n"
-                f"**Ticket type:** {display_name}\n"
-                "Please explain what you need help with. A member of our support team "
-                "will assist you as soon as possible."
+                f"Welcome, {interaction.user.mention}. You’re in the right place.\n\n"
+                f"**Support route:** {display_name}\n"
+                "Tell us what happened, what you need and what a great outcome looks like. "
+                "A Harps Community team member will take it from here."
             ),
-            color=discord.Color.blurple(),
+            color=HARPS_ACCENT_COLOR,
+            timestamp=discord.utils.utcnow(),
         )
         embed.add_field(
-            name="Before you begin",
-            value="Include any relevant details or screenshots so we can help quickly.",
+            name="✨ Help us help you faster",
+            value=(
+                "Share the important details, names, dates and screenshots in one message. "
+                "For reports, include evidence without publicly confronting anyone."
+            ),
             inline=False,
         )
-        embed.set_footer(text="Harps Community • Support Team")
+        embed.add_field(
+            name="🔐 Private by design",
+            value="Only you, the bot and authorized Harps Community staff can see this channel.",
+            inline=False,
+        )
+        if guild.icon is not None:
+            embed.set_thumbnail(url=guild.icon.url)
+            embed.set_author(name=guild.name, icon_url=guild.icon.url)
+        embed.set_footer(text="Harps Community • Real people, real support")
         await channel.send(
             content=interaction.user.mention, embed=embed, view=CloseTicketView()
         )
@@ -2750,13 +2825,17 @@ async def create_lfg_listing(
             capacity_key = str(session["capacity"])
             capacity = int(capacity_key)
             expires_at = discord.utils.utcnow() + timedelta(hours=LFG_EXPIRY_HOURS)
+            game_emoji = LFG_GAME_EMOJIS.get(game_key, "🎮")
             embed = discord.Embed(
-                title=f"🎮 {LFG_GAMES[game_key]} • {LFG_TEAM_SIZES[capacity_key]}",
-                description=(
-                    f"{interaction.user.mention} is building a team. Use the buttons "
-                    "below to join, leave, contact the host, or close the listing."
+                title=(
+                    f"{game_emoji} {LFG_GAMES[game_key]} • "
+                    f"{LFG_TEAM_SIZES[capacity_key]}"
                 ),
-                color=discord.Color.blurple(),
+                description=(
+                    f"**A new team is forming.** {interaction.user.mention} is looking "
+                    "for players who match the vibe. Check the details, then claim your spot!"
+                ),
+                color=discord.Color(LFG_GAME_COLORS.get(game_key, HARPS_ACCENT_COLOR.value)),
                 timestamp=discord.utils.utcnow(),
             )
             embed.add_field(name="Game", value=LFG_GAMES[game_key], inline=True)
@@ -2765,10 +2844,10 @@ async def create_lfg_listing(
             embed.add_field(name="Platform", value=LFG_PLATFORMS[platform_key], inline=True)
             embed.add_field(name="Language", value=str(session["language"]), inline=True)
             embed.add_field(name="Microphone", value=str(session["microphone"]), inline=True)
-            embed.add_field(name="Rank / skill", value=shortened(rank, 100), inline=False)
-            embed.add_field(name="Playing", value=shortened(play_time, 100), inline=False)
+            embed.add_field(name="🎯 Rank / skill", value=shortened(rank, 100), inline=False)
+            embed.add_field(name="🕒 Playing", value=shortened(play_time, 100), inline=False)
             embed.add_field(
-                name="Requirements", value=shortened(requirements, 700), inline=False
+                name="✨ Requirements", value=shortened(requirements, 700), inline=False
             )
             embed.add_field(name="Players", value=interaction.user.mention, inline=False)
             embed.add_field(name="Team progress", value=f"**1 / {capacity}**", inline=True)
@@ -2780,6 +2859,10 @@ async def create_lfg_listing(
             )
             if guild.icon is not None:
                 embed.set_thumbnail(url=guild.icon.url)
+            embed.set_author(
+                name=f"Hosted by {interaction.user.display_name}",
+                icon_url=interaction.user.display_avatar.url,
+            )
             embed.set_footer(
                 text=(
                     f"harps-lfg:guild={guild.id};host={interaction.user.id};"
@@ -4174,10 +4257,26 @@ async def ping(ctx: commands.Context):
 async def membercount(ctx: commands.Context):
     member_total = ctx.guild.member_count or len(ctx.guild.members)
     embed = discord.Embed(
-        title="👥 Harps Community Members",
-        description=f"We currently have **{member_total:,} members** in the server!",
-        color=discord.Color.blurple(),
+        title="🔥 The Harps Community Is Growing",
+        description=(
+            f"We are now **{member_total:,} members strong**—gamers, creators, partners "
+            "and new friends building something special together."
+        ),
+        color=HARPS_PRIMARY_COLOR,
     )
+    embed.add_field(
+        name="🎮 Find a team", value="Create or join an LFG listing.", inline=True
+    )
+    embed.add_field(
+        name="🤝 Make connections", value="Meet people and grow with the community.", inline=True
+    )
+    if ctx.guild.icon is not None:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+        embed.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon.url)
+    banner_url = server_banner_url(ctx.guild)
+    if banner_url is not None:
+        embed.set_image(url=banner_url)
+    embed.set_footer(text="Harps Community • Better together")
     await ctx.send(embed=embed)
 
 
@@ -4895,9 +4994,25 @@ async def rules(ctx: commands.Context):
 
     embed = discord.Embed(
         title="📚 Κανόνες του Harps Community",
-        description=SERVER_RULES,
-        color=discord.Color.blurple(),
+        description=(
+            "**Καλώς ήρθατε στο σπίτι της κοινότητάς μας.**\n"
+            "Οι κανόνες κρατούν το Harps ασφαλές, φιλικό και διασκεδαστικό για όλους.\n\n"
+            f"{SERVER_RULES}"
+        ),
+        color=HARPS_PRIMARY_COLOR,
+        timestamp=discord.utils.utcnow(),
     )
+    embed.add_field(
+        name="🛡️ Θυμήσου",
+        value="Σεβασμός πρώτα • Διασκέδαση πάντα • Αναφορά προβλημάτων μέσω ticket",
+        inline=False,
+    )
+    if ctx.guild.icon is not None:
+        embed.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon.url)
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+    banner_url = server_banner_url(ctx.guild)
+    if banner_url is not None:
+        embed.set_image(url=banner_url)
     embed.set_footer(
         text="Harps Community • Με την παραμονή σας στον server αποδέχεστε τους κανόνες"
     )
@@ -4925,13 +5040,13 @@ async def rolerequestpanel(ctx: commands.Context):
     embed = discord.Embed(
         title="🎭 Harps Community Role Requests",
         description=(
-            "Want a community role? Click **Request a Role** below, choose from the "
-            "available roles and a private review channel will be created for you."
+            "Your roles shape how you show up in Harps Community. Choose the role you "
+            "want, tell us why it fits and staff will review it privately."
         ),
-        color=discord.Color.from_rgb(171, 71, 188),
+        color=HARPS_ACCENT_COLOR,
     )
     embed.add_field(
-        name="📋 How it works",
+        name="⚡ Three quick steps",
         value=(
             "**1.** Click the button and choose a role.\n"
             "**2.** Add any helpful context in your private request.\n"
@@ -4940,7 +5055,7 @@ async def rolerequestpanel(ctx: commands.Context):
         inline=False,
     )
     embed.add_field(
-        name="🔐 Safe and private",
+        name="🔐 Private, fair and secure",
         value=(
             "Only you and authorized staff can see your request. Staff, managed and "
             "dangerous-permission roles are never available through this panel."
@@ -4949,7 +5064,11 @@ async def rolerequestpanel(ctx: commands.Context):
     )
     if ctx.guild.icon is not None:
         embed.set_thumbnail(url=ctx.guild.icon.url)
-    embed.set_footer(text="Harps Community • One open role request per member")
+        embed.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon.url)
+    banner_url = server_banner_url(ctx.guild)
+    if banner_url is not None:
+        embed.set_image(url=banner_url)
+    embed.set_footer(text="Harps Community • Build your identity")
     await channel.send(embed=embed, view=RoleRequestPanelView())
     await ctx.send(f"✅ Role-request panel posted in {channel.mention}.")
 
@@ -4972,15 +5091,15 @@ async def boostpanel(ctx: commands.Context):
     boost_count = ctx.guild.premium_subscription_count or 0
     boost_level = int(ctx.guild.premium_tier)
     embed = discord.Embed(
-        title="🚀 Boost Harps Community",
+        title="🚀 Power Up Harps Community",
         description=(
-            "Help us level up Harps Community! Every boost supports the entire server "
-            "and helps unlock better community features for everyone. 💜"
+            "A boost is more than a badge—it helps the whole community look better, "
+            "sound better and unlock more ways to have fun together. 💜"
         ),
-        color=discord.Color.from_rgb(244, 127, 255),
+        color=HARPS_ACCENT_COLOR,
     )
     embed.add_field(
-        name="✨ Why boost?",
+        name="✨ Your boost upgrades everyone’s experience",
         value=(
             "Boosts help unlock more emoji, sticker and soundboard slots, better server "
             "customization and other Discord perks for the whole community."
@@ -4990,16 +5109,20 @@ async def boostpanel(ctx: commands.Context):
     embed.add_field(name="🚀 Current boosts", value=f"**{boost_count:,}**", inline=True)
     embed.add_field(name="💎 Server level", value=f"**Level {boost_level}**", inline=True)
     embed.add_field(
-        name="💜 Thank you",
-        value="Every booster directly helps the community. We truly appreciate your support!",
+        name="💜 Become part of the story",
+        value=(
+            "Every booster helps Harps grow into a stronger gaming and social community. "
+            "Your support genuinely matters."
+        ),
         inline=False,
     )
     if ctx.guild.icon is not None:
         embed.set_thumbnail(url=ctx.guild.icon.url)
+        embed.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon.url)
     banner_url = server_banner_url(ctx.guild)
     if banner_url is not None:
         embed.set_image(url=banner_url)
-    embed.set_footer(text="Harps Community • Thank you for helping us grow!")
+    embed.set_footer(text="Harps Community • Built by the people who believe in it")
 
     await channel.send(embed=embed, view=BoostPanelView())
     await ctx.send(f"✅ Server-boost panel posted in {channel.mention}.")
@@ -5096,13 +5219,13 @@ async def lfg_setup(ctx: commands.Context):
         rules_embed = discord.Embed(
             title="📌 Harps Community LFG Rules",
             description=(
-                "Use LFG to find friendly teammates and build Duos, Trios, Squads or "
-                "full competitive teams. Keep every listing honest, respectful and safe."
+                "Great teams start with good energy. Use LFG to meet new people, build "
+                "your next Duo, Trio or Squad, and turn a queue into a community moment."
             ),
-            color=discord.Color.blurple(),
+            color=HARPS_PRIMARY_COLOR,
         )
         rules_embed.add_field(
-            name="Community rules",
+            name="🛡️ Play fair. Stay respectful.",
             value=(
                 "• No harassment, discrimination, trolling or toxic requirements.\n"
                 "• No links, Discord invites, advertisements, boosting or account sales.\n"
@@ -5113,14 +5236,20 @@ async def lfg_setup(ctx: commands.Context):
             inline=False,
         )
         rules_embed.add_field(
-            name="Voice rooms",
+            name="🎙️ Your team, your voice room",
             value=(
                 f"Join **{LFG_VOICE_CREATOR_NAME}** to receive a temporary room. "
-                "It is removed automatically when everyone leaves."
+                "Bring your team in—it disappears automatically when everyone leaves."
             ),
             inline=False,
         )
-        rules_embed.set_footer(text="Harps Community • Play together, respect everyone")
+        if ctx.guild.icon is not None:
+            rules_embed.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon.url)
+            rules_embed.set_thumbnail(url=ctx.guild.icon.url)
+        banner_url = server_banner_url(ctx.guild)
+        if banner_url is not None:
+            rules_embed.set_image(url=banner_url)
+        rules_embed.set_footer(text="Harps Community • Good teammates make great games")
         await upsert_lfg_embed(
             rules_channel, "📌 Harps Community LFG Rules", rules_embed
         )
@@ -5128,32 +5257,38 @@ async def lfg_setup(ctx: commands.Context):
         panel_embed = discord.Embed(
             title="🎮 Find Your Team",
             description=(
-                "Ready to play? Create a detailed LFG listing and let other Harps "
-                "Community members join your team."
+                "**Stop solo-queuing. Start building memories.**\n\n"
+                "Create a polished listing in under a minute and meet Harps players "
+                "who match your game, region, platform and vibe."
             ),
-            color=discord.Color.blurple(),
+            color=HARPS_ACCENT_COLOR,
         )
         panel_embed.add_field(
-            name="How it works",
+            name="⚡ From click to squad",
             value=(
                 "1. Press **Create LFG**.\n"
                 "2. Choose your game, team size, region and platform.\n"
                 "3. Add language, microphone, rank, schedule and requirements.\n"
-                "4. Manage your team from the listing buttons."
+                "4. Let members join and take the squad into voice."
             ),
             inline=False,
         )
         panel_embed.add_field(
-            name="Available formats",
+            name="👥 Build it your way",
             value="Duo • Trio • Squad • 5 Stack • Custom Team",
-            inline=False,
+            inline=True,
         )
         panel_embed.add_field(
-            name="Automatic cleanup",
-            value=f"Listings expire after **{LFG_EXPIRY_HOURS} hours**.",
-            inline=False,
+            name="🧹 Fresh listings only",
+            value=f"Auto-expires after **{LFG_EXPIRY_HOURS} hours**.",
+            inline=True,
         )
-        panel_embed.set_footer(text="Harps Community • Looking For Group")
+        if ctx.guild.icon is not None:
+            panel_embed.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon.url)
+            panel_embed.set_thumbnail(url=ctx.guild.icon.url)
+        if banner_url is not None:
+            panel_embed.set_image(url=banner_url)
+        panel_embed.set_footer(text="Harps Community • Your next team is one click away")
         panel_message = await upsert_lfg_embed(
             create_channel,
             "🎮 Find Your Team",
@@ -5184,21 +5319,33 @@ async def ticketpanel(ctx: commands.Context):
     embed = discord.Embed(
         title="🎫 Harps Community Support",
         description=(
-            "Need assistance? Choose the option that best matches your request below.\n\n"
-            "A private ticket will be created for you and the Harps Community staff team."
+            "Questions, concerns or a big idea? **You are in the right place.**\n\n"
+            "Choose the option that fits best and we will create a private space where "
+            "you can speak directly with the Harps staff team."
         ),
-        color=discord.Color.blurple(),
+        color=HARPS_ACCENT_COLOR,
     )
     embed.add_field(
-        name="Support options",
+        name="✨ Choose your path",
         value=(
-            "🎫 **General Support** — Questions or server help\n"
-            "🚨 **Report a Member** — Privately report an issue\n"
-            "🤝 **Partnership / Other** — Partnerships and other enquiries"
+            "🎫 **General Support** — Get answers and server help\n"
+            "🚨 **Report a Member** — Share a concern safely and privately\n"
+            "🤝 **Partnership / Other** — Build something exciting with us"
         ),
         inline=False,
     )
-    embed.set_footer(text="Harps Community • Please open only one ticket per topic")
+    embed.add_field(
+        name="🔐 Private from the first click",
+        value="Only you, the bot and authorized Harps staff can see your ticket.",
+        inline=False,
+    )
+    if ctx.guild.icon is not None:
+        embed.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon.url)
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+    banner_url = server_banner_url(ctx.guild)
+    if banner_url is not None:
+        embed.set_image(url=banner_url)
+    embed.set_footer(text="Harps Community • Real support from real people")
     await ctx.send(embed=embed, view=TicketPanelView())
 
 
