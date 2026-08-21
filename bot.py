@@ -1205,6 +1205,50 @@ class RoleRequestDecisionView(discord.ui.View):
         await self.finish_request(interaction, approved=False)
 
 
+class BoostPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Boost the Server",
+        style=discord.ButtonStyle.primary,
+        emoji="🚀",
+        custom_id="harps:server:boost",
+    )
+    async def boost_server(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This button only works inside Harps Community.", ephemeral=True
+            )
+            return
+        boost_url = (
+            f"https://discord.com/channels/{interaction.guild.id}/"
+            "premium-guild-subscription"
+        )
+        link_view = discord.ui.View()
+        link_view.add_item(
+            discord.ui.Button(
+                label="Continue to Discord Boosting",
+                style=discord.ButtonStyle.link,
+                emoji="💎",
+                url=boost_url,
+            )
+        )
+        embed = discord.Embed(
+            title="🚀 Ready to Boost Harps Community?",
+            description=(
+                "Thank you for supporting our community! Use the secure Discord button "
+                "below to review and confirm your boost."
+            ),
+            color=discord.Color.blue(),
+        )
+        await interaction.response.send_message(
+            embed=embed, view=link_view, ephemeral=True
+        )
+
+
 class CloseConfirmationView(discord.ui.View):
     def __init__(self, requester_id: int):
         super().__init__(timeout=60)
@@ -1455,6 +1499,7 @@ bot.add_view(TicketPanelView())
 bot.add_view(CloseTicketView())
 bot.add_view(RoleRequestPanelView())
 bot.add_view(RoleRequestDecisionView())
+bot.add_view(BoostPanelView())
 
 
 @bot.event
@@ -2682,19 +2727,7 @@ async def boostpanel(ctx: commands.Context):
         embed.set_image(url=banner_url)
     embed.set_footer(text="Harps Community • Thank you for helping us grow!")
 
-    view = discord.ui.View(timeout=None)
-    view.add_item(
-        discord.ui.Button(
-            label="Boost the Server",
-            emoji="🚀",
-            style=discord.ButtonStyle.link,
-            url=(
-                f"https://discord.com/channels/{ctx.guild.id}/"
-                "premium-guild-subscription"
-            ),
-        )
-    )
-    await channel.send(embed=embed, view=view)
+    await channel.send(embed=embed, view=BoostPanelView())
     await ctx.send(f"✅ Server-boost panel posted in {channel.mention}.")
 
 
