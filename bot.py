@@ -1223,26 +1223,38 @@ class BoostPanelView(discord.ui.View):
                 "This button only works inside Harps Community.", ephemeral=True
             )
             return
-        boost_url = (
-            f"https://discord.com/channels/{interaction.guild.id}/"
-            "premium-guild-subscription"
-        )
         link_view = discord.ui.View()
         link_view.add_item(
             discord.ui.Button(
-                label="Continue to Discord Boosting",
+                label="Discord Boosting Help",
                 style=discord.ButtonStyle.link,
                 emoji="💎",
-                url=boost_url,
+                url="https://support.discord.com/hc/en-us/articles/360028038352-Server-Boosting-FAQ",
             )
         )
         embed = discord.Embed(
             title="🚀 Ready to Boost Harps Community?",
             description=(
-                "Thank you for supporting our community! Use the secure Discord button "
-                "below to review and confirm your boost."
+                "Thank you for supporting our community! Discord requires boosts to be "
+                "confirmed from its built-in **Server Boost** screen."
             ),
             color=discord.Color.blue(),
+        )
+        embed.add_field(
+            name="🖥️ Desktop / Browser",
+            value=(
+                "Open **Harps Community**, then click **Server Boost** above the channel "
+                "list—or click the server name and choose **Server Boost**."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="📱 Mobile",
+            value=(
+                "Tap the **Harps Community** name at the top, then choose "
+                "**Boost Server** or **Server Boost**."
+            ),
+            inline=False,
         )
         await interaction.response.send_message(
             embed=embed, view=link_view, ephemeral=True
