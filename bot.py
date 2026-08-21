@@ -1252,6 +1252,13 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
 async def on_guild_channel_update(
     before: discord.abc.GuildChannel, after: discord.abc.GuildChannel
 ):
+    # The bot renames this statistics channel whenever the member total
+    # changes. That internal update is expected and should not create noise.
+    if before.name.startswith(MEMBER_COUNT_CHANNEL_PREFIX) or after.name.startswith(
+        MEMBER_COUNT_CHANNEL_PREFIX
+    ):
+        return
+
     changes = []
     if before.name != after.name:
         changes.append(f"Name: `{before.name}` → `{after.name}`")
