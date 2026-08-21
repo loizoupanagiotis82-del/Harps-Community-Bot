@@ -31,6 +31,7 @@ MOD_LOG_CATEGORY_NAME = "🛡️ MODERATION LOGS"
 AUTO_ROLE_NAME = "🔥│Regulars"
 ROLE_REQUEST_PANEL_CHANNEL_NAME = "🕴role-request"
 ROLE_REQUEST_CATEGORY_NAME = "🎭 ROLE REQUESTS"
+BOOST_PANEL_CHANNEL_NAME = "🚀server-boost"
 SERVER_LOG_CATEGORY_NAME = "📋 SERVER LOGS"
 ANTINUKE_WHITELIST_ROLE_NAME = "🛡️ Anti-Nuke Whitelist"
 ANTINUKE_MASS_THRESHOLD = 3
@@ -2636,6 +2637,69 @@ async def rolerequestpanel(ctx: commands.Context):
 
 @bot.hybrid_command()
 @commands.has_permissions(administrator=True)
+async def boostpanel(ctx: commands.Context):
+    """Post the Harps Community server-boost panel."""
+    channel = discord.utils.get(
+        ctx.guild.text_channels, name=BOOST_PANEL_CHANNEL_NAME
+    )
+    if channel is None:
+        channel = discord.utils.find(
+            lambda item: item.name.endswith("server-boost"), ctx.guild.text_channels
+        )
+    if channel is None:
+        await ctx.send(f"I could not find the `{BOOST_PANEL_CHANNEL_NAME}` channel.")
+        return
+
+    boost_count = ctx.guild.premium_subscription_count or 0
+    boost_level = int(ctx.guild.premium_tier)
+    embed = discord.Embed(
+        title="🚀 Boost Harps Community",
+        description=(
+            "Help us level up Harps Community! Every boost supports the entire server "
+            "and helps unlock better community features for everyone. 💜"
+        ),
+        color=discord.Color.from_rgb(244, 127, 255),
+    )
+    embed.add_field(
+        name="✨ Why boost?",
+        value=(
+            "Boosts help unlock more emoji, sticker and soundboard slots, better server "
+            "customization and other Discord perks for the whole community."
+        ),
+        inline=False,
+    )
+    embed.add_field(name="🚀 Current boosts", value=f"**{boost_count:,}**", inline=True)
+    embed.add_field(name="💎 Server level", value=f"**Level {boost_level}**", inline=True)
+    embed.add_field(
+        name="💜 Thank you",
+        value="Every booster directly helps the community. We truly appreciate your support!",
+        inline=False,
+    )
+    if ctx.guild.icon is not None:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+    banner_url = server_banner_url(ctx.guild)
+    if banner_url is not None:
+        embed.set_image(url=banner_url)
+    embed.set_footer(text="Harps Community • Thank you for helping us grow!")
+
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="Boost the Server",
+            emoji="🚀",
+            style=discord.ButtonStyle.link,
+            url=(
+                f"https://discord.com/channels/{ctx.guild.id}/"
+                "premium-guild-subscription"
+            ),
+        )
+    )
+    await channel.send(embed=embed, view=view)
+    await ctx.send(f"✅ Server-boost panel posted in {channel.mention}.")
+
+
+@bot.hybrid_command()
+@commands.has_permissions(administrator=True)
 async def ticketpanel(ctx: commands.Context):
     embed = discord.Embed(
         title="🎫 Harps Community Support",
@@ -2659,6 +2723,7 @@ async def ticketpanel(ctx: commands.Context):
 
 
 @ticketpanel.error
+@boostpanel.error
 @rolerequestpanel.error
 @rules.error
 @antinuke_unwhitelist.error
