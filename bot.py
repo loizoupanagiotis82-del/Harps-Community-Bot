@@ -26,6 +26,7 @@ WELCOME_CHANNEL_NAME = "📜・welcome"
 GOODBYE_CHANNEL_NAME = "📜・goodbye"
 RULES_CHANNEL_NAME = "📚server-rules"
 MOD_LOG_CATEGORY_NAME = "🛡️ MODERATION LOGS"
+AUTO_ROLE_NAME = "🔥│Regulars"
 
 MOD_LOG_CHANNELS = {
     "kick": "kick-logs",
@@ -209,6 +210,44 @@ def parse_timeout_duration(value: str) -> timedelta | None:
     if duration <= timedelta(0) or duration > timedelta(days=28):
         return None
     return duration
+
+
+async def give_regular_role(member: discord.Member) -> bool:
+    """Give the configured Regulars role to a human member when possible."""
+    if member.bot:
+        return False
+    role = discord.utils.get(member.guild.roles, name=AUTO_ROLE_NAME)
+    if role is None or role in member.roles:
+        return False
+    bot_member = member.guild.me
+    if bot_member is None or role >= bot_member.top_role:
+        raise RuntimeError(
+            f"The {AUTO_ROLE_NAME} role must be below the bot's highest role."
+        )
+    await member.add_roles(role, reason="Harps Community automatic member role")
+    return True
+
+
+async def sync_regular_roles(guild: discord.Guild, reason: str) -> tuple[int, int]:
+    role = discord.utils.get(guild.roles, name=AUTO_ROLE_NAME)
+    if role is None:
+        return 0, 0
+    if guild.me is None or role >= guild.me.top_role:
+        raise RuntimeError(
+            f"The {AUTO_ROLE_NAME} role must be below the bot's highest role."
+        )
+
+    updated = 0
+    failed = 0
+    for member in guild.members:
+        if member.bot or role in member.roles:
+            continue
+        try:
+            await member.add_roles(role, reason=reason)
+            updated += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed += 1
+    return updated, failed
 
 
 async def update_member_count(
@@ -662,10 +701,24 @@ async def on_ready():
             await update_member_count(guild)
         except (discord.Forbidden, discord.HTTPException) as error:
             print(f"Could not update member counter in {guild.name}: {error}")
+        try:
+            updated, failed = await sync_regular_roles(
+                guild, "Harps Community automatic startup autorole sync"
+            )
+            if updated or failed:
+                print(
+                    f"Autorole sync in {guild.name}: {updated} updated, {failed} failed"
+                )
+        except (discord.Forbidden, discord.HTTPException, RuntimeError) as error:
+            print(f"Could not sync {AUTO_ROLE_NAME} in {guild.name}: {error}")
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
+    try:
+        await give_regular_role(member)
+    except (discord.Forbidden, discord.HTTPException, RuntimeError) as error:
+        print(f"Could not give {AUTO_ROLE_NAME} to {member}: {error}")
     await send_welcome(member)
     try:
         await update_member_count(member.guild)
@@ -1014,6 +1067,35 @@ async def setupmembercount(ctx: commands.Context):
 
 @bot.hybrid_command()
 @commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(manage_roles=True)
+async def syncautorole(ctx: commands.Context):
+    """Give the Regulars role to every current human member who is missing it."""
+    role = discord.utils.get(ctx.guild.roles, name=AUTO_ROLE_NAME)
+    if role is None:
+        await ctx.send(f"I could not find the role `{AUTO_ROLE_NAME}`.")
+        return
+    if ctx.guild.me is None or role >= ctx.guild.me.top_role:
+        await ctx.send(
+            f"Move my bot role above `{AUTO_ROLE_NAME}` in Server Settings → Roles first."
+        )
+        return
+
+    if ctx.interaction is not None:
+        await ctx.defer()
+
+    updated, failed = await sync_regular_roles(
+        ctx.guild,
+        f"Autorole sync requested by {ctx.author} ({ctx.author.id})",
+    )
+
+    result = f"✅ Added `{AUTO_ROLE_NAME}` to **{updated}** existing members."
+    if failed:
+        result += f" **{failed}** members could not be updated."
+    await ctx.send(result)
+
+
+@bot.hybrid_command()
+@commands.has_permissions(administrator=True)
 async def setupmodlogs(ctx: commands.Context):
     try:
         created_channels = []
@@ -1115,6 +1197,7 @@ async def ticketpanel(ctx: commands.Context):
 
 @ticketpanel.error
 @rules.error
+@syncautorole.error
 @setupmodlogs.error
 @setupmembercount.error
 @testwelcome.error
@@ -1122,6 +1205,10 @@ async def ticketpanel(ctx: commands.Context):
 async def admin_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("You need the Administrator permission to use this command.")
+        return
+    if isinstance(error, commands.BotMissingPermissions):
+        permissions = ", ".join(error.missing_permissions)
+        await ctx.send(f"I need the following permission(s): `{permissions}`.")
         return
     raise error
 
