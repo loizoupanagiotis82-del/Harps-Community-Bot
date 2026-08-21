@@ -42,12 +42,11 @@ SAFETY_LOG_CHANNEL_NAME = "safety-logs"
 SAFETY_WHITELIST_ROLE_NAME = "🛡️ Safety Whitelist"
 SAFETY_SPAM_WINDOW_SECONDS = 5
 SAFETY_DUPLICATE_WINDOW_SECONDS = 15
-SAFETY_INVITE_WINDOW_SECONDS = 60
-SAFETY_EVERYONE_WINDOW_SECONDS = 30
 SAFETY_INCIDENT_COOLDOWN_SECONDS = 30
+SAFETY_BAN_DELETE_SECONDS = 7 * 24 * 60 * 60
 
-# These defaults are deliberately conservative. Borderline incidents are sent
-# to staff for review; only the higher "auto" thresholds cause a timeout.
+# These defaults control spam and mass-mention review/timeout thresholds.
+# Links and @everyone/@here pings use the separate immediate-ban rule below.
 SAFETY_DEFAULT_CONFIG = {
     "spam_review": 6,
     "spam_auto": 10,
@@ -55,15 +54,14 @@ SAFETY_DEFAULT_CONFIG = {
     "mention_auto": 8,
     "duplicate_review": 3,
     "duplicate_auto": 6,
-    "invite_auto": 3,
     "timeout_minutes": 10,
 }
 
-# Add invite codes belonging to Harps Community if the bot cannot read the
-# server's invite list. Use only the code, for example: {"harps", "abc123"}.
-SAFETY_ALLOWED_INVITE_CODES: set[str] = set()
-DISCORD_INVITE_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:discord(?:app)?\.com/invite|discord\.gg)/([a-z0-9-]+)",
+# Matches normal URLs, Discord invites, www links and bare domains.
+LINK_PATTERN = re.compile(
+    r"(?:https?://|www\.)[^\s<]+|"
+    r"(?<![@\w])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z]{2,63}(?::\d{2,5})?(?:/[^\s<]*)?",
     re.IGNORECASE,
 )
 
@@ -138,12 +136,9 @@ safety_message_activity: dict[tuple[int, int], deque[float]] = defaultdict(deque
 safety_duplicate_activity: dict[
     tuple[int, int], deque[tuple[float, str]]
 ] = defaultdict(deque)
-safety_invite_activity: dict[tuple[int, int], deque[float]] = defaultdict(deque)
-safety_everyone_activity: dict[tuple[int, int], deque[float]] = defaultdict(deque)
 safety_incident_cooldowns: dict[tuple[int, int, str], float] = {}
 safety_setup_locks: dict[int, asyncio.Lock] = {}
 safety_review_action_locks: dict[int, asyncio.Lock] = {}
-safety_invite_cache: dict[int, tuple[float, set[str]]] = {}
 slash_commands_synced = False
 
 
@@ -1699,33 +1694,6 @@ def prune_safety_timestamps(
     return len(timestamps)
 
 
-async def current_server_invite_codes(guild: discord.Guild) -> set[str]:
-    now = time.monotonic()
-    cached = safety_invite_cache.get(guild.id)
-    if cached is not None and now - cached[0] < 300:
-        return cached[1]
-    codes = {code.casefold() for code in SAFETY_ALLOWED_INVITE_CODES}
-    try:
-        invites = await guild.invites()
-    except (discord.Forbidden, discord.HTTPException):
-        pass
-    else:
-        codes.update(invite.code.casefold() for invite in invites)
-    safety_invite_cache[guild.id] = (now, codes)
-    return codes
-
-
-async def external_invites_in(message: discord.Message) -> list[str]:
-    found_codes = {
-        match.group(1).casefold()
-        for match in DISCORD_INVITE_PATTERN.finditer(message.content)
-    }
-    if not found_codes:
-        return []
-    allowed_codes = await current_server_invite_codes(message.guild)
-    return sorted(code for code in found_codes if code not in allowed_codes)
-
-
 def safety_review_metadata(message: discord.Message) -> dict[str, int | str] | None:
     if not message.embeds:
         return None
@@ -2255,6 +2223,94 @@ async def remove_unsafe_message(message: discord.Message) -> bool:
         return False
 
 
+async def immediately_ban_for_safety(
+    message: discord.Message, reason_code: str, reason_name: str
+) -> None:
+    """Ban a non-whitelisted link/everyone sender and purge seven days of messages."""
+    message_removed = await remove_unsafe_message(message)
+    preview = shortened(message.content or "[empty message]", 1000)
+    guild = message.guild
+    member = message.author
+
+    blocked = (
+        "The bot member was not available."
+        if guild.me is None
+        else safety_target_block_reason(guild, guild.me, member)
+    )
+    if blocked:
+        await send_safety_review(
+            message,
+            reason_code,
+            f"{reason_name} (automatic ban failed)",
+            f"**Message**\n{preview}\n\n**Failure**\n{blocked}",
+        )
+        await send_safety_log(
+            guild,
+            "⚠️ Immediate Safety Ban Failed",
+            f"The violating message from {member.mention} was sent to staff review.",
+            color=discord.Color.orange(),
+            fields=[
+                ("Reason", reason_name, False),
+                ("Failure", blocked, False),
+                ("Message removed", "Yes" if message_removed else "No", True),
+            ],
+        )
+        return
+
+    try:
+        await guild.ban(
+            member,
+            reason=f"Immediate chat safety ban: {reason_name}",
+            delete_message_seconds=SAFETY_BAN_DELETE_SECONDS,
+        )
+    except (discord.Forbidden, discord.HTTPException) as error:
+        await send_safety_review(
+            message,
+            reason_code,
+            f"{reason_name} (automatic ban failed)",
+            f"**Message**\n{preview}\n\n**Failure**\n{error}",
+        )
+        await send_safety_log(
+            guild,
+            "⚠️ Immediate Safety Ban Failed",
+            f"The violating message from {member.mention} was sent to staff review.",
+            color=discord.Color.orange(),
+            fields=[
+                ("Reason", reason_name, False),
+                ("Failure", str(error), False),
+                ("Message removed", "Yes" if message_removed else "No", True),
+            ],
+        )
+        return
+
+    safety_message_activity.pop((guild.id, member.id), None)
+    safety_duplicate_activity.pop((guild.id, member.id), None)
+    await send_safety_log(
+        guild,
+        "🔨 Immediate Chat Safety Ban",
+        (
+            f"{member.mention} (`{member.id}`) was banned immediately and up to "
+            "seven days of their recent server messages were deleted."
+        ),
+        color=discord.Color.red(),
+        fields=[
+            ("Reason", reason_name, False),
+            ("Message", preview, False),
+            ("Trigger message removed", "Yes" if message_removed else "No", True),
+        ],
+    )
+    await send_mod_log(
+        guild,
+        "ban",
+        "🔨 Immediate Chat Safety Ban",
+        guild.me,
+        target=member,
+        reason=reason_name,
+        details="Discord ban cleanup requested for the previous seven days of messages",
+        color=discord.Color.red(),
+    )
+
+
 async def automatically_timeout_for_safety(
     member: discord.Member, reason_name: str, minutes: int
 ) -> tuple[bool, str, datetime]:
@@ -2372,6 +2428,19 @@ async def inspect_message_for_safety(message: discord.Message) -> None:
     if is_safety_whitelisted(message.author) or is_safety_exempt_channel(message.channel):
         return
 
+    if LINK_PATTERN.search(message.content):
+        await immediately_ban_for_safety(
+            message, "forbidden_link", "Posted a link without safety whitelist"
+        )
+        return
+    if message.mention_everyone:
+        await immediately_ban_for_safety(
+            message,
+            "everyone_mention",
+            "Used @everyone/@here without safety whitelist",
+        )
+        return
+
     now = time.monotonic()
     member_key = (message.guild.id, message.author.id)
     review_channel = await get_safety_channel(
@@ -2397,25 +2466,9 @@ async def inspect_message_for_safety(message: discord.Message) -> None:
         else 0
     )
 
-    external_codes = await external_invites_in(message)
-    invite_times = safety_invite_activity[member_key]
-    invite_times.extend(now for _ in external_codes)
-    invite_count = prune_safety_timestamps(
-        invite_times, now, SAFETY_INVITE_WINDOW_SECONDS
-    )
-
     user_mentions = len(re.findall(r"<@!?\d+>", message.content))
     role_mentions = len(re.findall(r"<@&\d+>", message.content))
     mention_count = user_mentions + role_mentions
-    everyone_tokens = len(
-        re.findall(r"(?<!\w)@(everyone|here)\b", message.content, re.IGNORECASE)
-    )
-    everyone_times = safety_everyone_activity[member_key]
-    if everyone_tokens:
-        everyone_times.extend(now for _ in range(everyone_tokens))
-    everyone_count = prune_safety_timestamps(
-        everyone_times, now, SAFETY_EVERYONE_WINDOW_SECONDS
-    )
 
     preview_parts = [message.content or "[empty message]"]
     if message.attachments:
@@ -2426,35 +2479,15 @@ async def inspect_message_for_safety(message: discord.Message) -> None:
     metrics = (
         f"Messages: {message_count}/{SAFETY_SPAM_WINDOW_SECONDS}s | "
         f"Duplicates: {duplicate_count}/{SAFETY_DUPLICATE_WINDOW_SECONDS}s | "
-        f"Mentions: {mention_count} | @everyone/@here: {everyone_count}/"
-        f"{SAFETY_EVERYONE_WINDOW_SECONDS}s | External invites: {invite_count}/"
-        f"{SAFETY_INVITE_WINDOW_SECONDS}s"
+        f"User/role mentions: {mention_count}"
     )
     evidence = f"**Message**\n{preview}\n\n**Detection totals**\n{metrics}"
 
-    if external_codes and invite_count >= config["invite_auto"]:
-        await handle_safety_incident(
-            message,
-            "repeated_external_invites",
-            "Repeated external Discord invites",
-            evidence,
-            automatic=True,
-            config=config,
-        )
-    elif mention_count >= config["mention_auto"]:
+    if mention_count >= config["mention_auto"]:
         await handle_safety_incident(
             message,
             "mass_mentions",
             "Mass user/role mentions",
-            evidence,
-            automatic=True,
-            config=config,
-        )
-    elif everyone_tokens >= 3 or everyone_count >= 3:
-        await handle_safety_incident(
-            message,
-            "repeated_everyone_mentions",
-            "Repeated @everyone/@here mentions",
             evidence,
             automatic=True,
             config=config,
@@ -2475,24 +2508,6 @@ async def inspect_message_for_safety(message: discord.Message) -> None:
             "High-speed message flood",
             evidence,
             automatic=True,
-            config=config,
-        )
-    elif external_codes:
-        await handle_safety_incident(
-            message,
-            "external_invite",
-            "External Discord invite",
-            evidence,
-            automatic=False,
-            config=config,
-        )
-    elif everyone_tokens:
-        await handle_safety_incident(
-            message,
-            "everyone_mention",
-            "@everyone/@here mention",
-            evidence,
-            automatic=False,
             config=config,
         )
     elif mention_count >= config["mention_review"]:
@@ -3088,7 +3103,6 @@ async def on_guild_update(before: discord.Guild, after: discord.Guild):
 async def on_invite_create(invite: discord.Invite):
     if invite.guild is None:
         return
-    safety_invite_cache.pop(invite.guild.id, None)
     await send_server_log(
         invite.guild,
         "server",
@@ -3106,7 +3120,6 @@ async def on_invite_create(invite: discord.Invite):
 async def on_invite_delete(invite: discord.Invite):
     if invite.guild is None:
         return
-    safety_invite_cache.pop(invite.guild.id, None)
     await send_server_log(
         invite.guild,
         "server",
@@ -3580,9 +3593,9 @@ async def safety(ctx: commands.Context):
     embed = discord.Embed(
         title="🛡️ Harps Community Chat Safety",
         description=(
-            "Chat safety is **enabled** whenever the bot is online. Borderline incidents "
-            "are removed and held for staff review; only clearly repeated abuse receives "
-            "an automatic timeout."
+            "Chat safety is **enabled** whenever the bot is online. Links and actual "
+            "@everyone/@here pings from non-whitelisted members cause an immediate ban. "
+            "Borderline spam is removed and held for staff review."
         ),
         color=discord.Color.green(),
     )
@@ -3613,12 +3626,9 @@ async def safety(ctx: commands.Context):
         inline=True,
     )
     embed.add_field(
-        name="External invites",
-        value=(
-            "First attempt: **staff review**\n"
-            f"Automatic: **{config['invite_auto']}** / {SAFETY_INVITE_WINDOW_SECONDS}s"
-        ),
-        inline=True,
+        name="Links and @everyone/@here",
+        value="**Immediate ban** + up to 7 days of message cleanup",
+        inline=False,
     )
     embed.add_field(
         name="Automatic timeout",
@@ -3645,7 +3655,6 @@ async def safety(ctx: commands.Context):
 @safety.command(name="setup")
 @commands.has_permissions(administrator=True)
 @commands.bot_has_permissions(
-    manage_guild=True,
     manage_channels=True,
     manage_roles=True,
     manage_messages=True,
@@ -3728,7 +3737,6 @@ async def safety_configure(ctx: commands.Context, setting: str, value: int):
         "mention_auto": (3, 50),
         "duplicate_review": (2, 10),
         "duplicate_auto": (3, 20),
-        "invite_auto": (2, 10),
         "timeout_minutes": (1, 1440),
     }
     setting = setting.casefold().strip()
