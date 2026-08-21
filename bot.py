@@ -690,12 +690,20 @@ async def on_ready():
     print(f"✅ Logged in as {bot.user}")
     if not slash_commands_synced:
         try:
+            guild_command_count = 0
+            for guild in bot.guilds:
+                bot.tree.copy_global_to(guild=guild)
+                guild_commands = await bot.tree.sync(guild=guild)
+                guild_command_count += len(guild_commands)
             synced_commands = await bot.tree.sync()
-        except discord.HTTPException as error:
+        except Exception as error:
             print(f"Could not sync slash commands: {error}")
         else:
             slash_commands_synced = True
-            print(f"✅ Synced {len(synced_commands)} slash commands")
+            print(
+                f"✅ Synced {len(synced_commands)} global slash commands and "
+                f"{guild_command_count} instant server commands"
+            )
     for guild in bot.guilds:
         try:
             await update_member_count(guild)
