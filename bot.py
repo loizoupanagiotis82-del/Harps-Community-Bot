@@ -23,6 +23,27 @@ SERVER_STATS_CATEGORY_NAME = "📊 SERVER STATS"
 MEMBER_COUNT_CHANNEL_PREFIX = "👥 Members:"
 WELCOME_CHANNEL_NAME = "📜・welcome"
 GOODBYE_CHANNEL_NAME = "📜・goodbye"
+RULES_CHANNEL_NAME = "📚server-rules"
+
+SERVER_RULES = """• Απαγορεύονται οι προσωπικές επιθέσεις, ο σεξισμός, ο ρατσισμός και οτιδήποτε σχετικό και οποιαδήποτε υποστήριξη των παραπάνω.
+
+• Δεν επιτρέπεται το ακατάλληλο περιεχόμενο 
+
+• Δεν επιτρέπονται οι διαφημίσεις 
+
+• Απαγορεύεται να κάνετε tag τα μέλη του server ή οποιοδήποτε μέλος του προσωπικού, εκτός εάν έχετε κάποια ερώτηση.
+
+• Δεν επιτρέπεται το spam
+
+• Μην διαφημίζετε discord server, social media, websites ή οτιδήποτε άλλο στον server μας και στα προσωπικά μηνύματα των member.
+
+• Απαγορεύεται η χρήση των alts για να αποκτήσετε πλεονεκτήματα στον server μας. Απαγορεύετε η χρήση των self-bot.
+
+• Απαγορεύεται το NSFW και το ακατάλληλο περιεχόμενο.
+
+• Βεβαιωθείτε ότι έχετε δημοσιεύσει το περιεχόμενό σας στο πιο κατάλληλο κανάλι. Σε περίπτωση που γράψετε σε άλλο κανάλι θα διαγράφεται το μήνυμα σας.
+
+Ακολουθήστε τους [Όρους Παροχής Υπηρεσιών του Discord](https://discord.com/terms) και τις [Οδηγίες κοινότητας](https://discord.com/guidelines)."""
 
 TICKET_TYPES = {
     "general": ("General Support", "general-support-logs"),
@@ -587,6 +608,26 @@ async def setupmembercount(ctx: commands.Context):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
+async def rules(ctx: commands.Context):
+    channel = discord.utils.get(ctx.guild.text_channels, name=RULES_CHANNEL_NAME)
+    if channel is None:
+        await ctx.send(f"Rules channel `{RULES_CHANNEL_NAME}` was not found.")
+        return
+
+    embed = discord.Embed(
+        title="📚 Κανόνες του Harps Community",
+        description=SERVER_RULES,
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(
+        text="Harps Community • Με την παραμονή σας στον server αποδέχεστε τους κανόνες"
+    )
+    await channel.send(embed=embed)
+    await ctx.send(f"✅ Οι κανόνες δημοσιεύτηκαν στο {channel.mention}.")
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
 async def ticketpanel(ctx: commands.Context):
     embed = discord.Embed(
         title="🎫 Harps Community Support",
@@ -610,6 +651,7 @@ async def ticketpanel(ctx: commands.Context):
 
 
 @ticketpanel.error
+@rules.error
 @setupmembercount.error
 @testwelcome.error
 @testgoodbye.error
