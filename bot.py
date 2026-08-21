@@ -7,7 +7,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -67,6 +67,55 @@ LINK_PATTERN = re.compile(
 
 # Exact channel names added here are ignored by chat safety checks.
 SAFETY_EXEMPT_CHANNEL_NAMES: set[str] = set()
+
+LFG_CATEGORY_NAME = "🎮 LOOKING FOR GROUP"
+LFG_RULES_CHANNEL_NAME = "📌・lfg-rules"
+LFG_CREATE_CHANNEL_NAME = "🎮・create-lfg"
+LFG_ACTIVE_CHANNEL_NAME = "🔎・active-lfg"
+LFG_COMPLETED_CHANNEL_NAME = "✅・completed-lfg"
+LFG_LOG_CHANNEL_NAME = "lfg-logs"
+LFG_VOICE_CREATOR_NAME = "🔊・Create Voice Room"
+LFG_TEMP_VOICE_PREFIX = "🎧│"
+LFG_EXPIRY_HOURS = 6
+
+LFG_GAMES = {
+    "valorant": "VALORANT",
+    "cs2": "Counter-Strike 2",
+    "cod": "Call of Duty / Warzone",
+    "fortnite": "Fortnite",
+    "rocket_league": "Rocket League",
+    "minecraft": "Minecraft",
+    "roblox": "Roblox",
+    "apex": "Apex Legends",
+    "overwatch_2": "Overwatch 2",
+    "rainbow_six": "Rainbow Six Siege",
+    "gta_online": "GTA Online",
+    "ea_fc": "EA Sports FC",
+}
+
+LFG_REGIONS = {
+    "eu": "Europe",
+    "me": "Middle East",
+    "na_east": "North America East",
+    "na_west": "North America West",
+    "asia": "Asia",
+    "oce": "Oceania",
+}
+
+LFG_PLATFORMS = {
+    "pc": "PC",
+    "playstation": "PlayStation",
+    "xbox": "Xbox",
+    "crossplay": "Crossplay",
+}
+
+LFG_TEAM_SIZES = {
+    "2": "Duo",
+    "3": "Trio",
+    "4": "Squad",
+    "5": "5 Stack",
+    "10": "Custom Team",
+}
 
 # IDs placed here are always trusted, including bots that are not in the server yet.
 ANTINUKE_WHITELIST_IDS: set[int] = set()
@@ -139,6 +188,11 @@ safety_duplicate_activity: dict[
 safety_incident_cooldowns: dict[tuple[int, int, str], float] = {}
 safety_setup_locks: dict[int, asyncio.Lock] = {}
 safety_review_action_locks: dict[int, asyncio.Lock] = {}
+lfg_setup_locks: dict[int, asyncio.Lock] = {}
+lfg_creation_locks: dict[tuple[int, int], asyncio.Lock] = {}
+lfg_listing_locks: dict[int, asyncio.Lock] = {}
+lfg_voice_locks: dict[tuple[int, int], asyncio.Lock] = {}
+lfg_temp_voice_owners: dict[int, int] = {}
 slash_commands_synced = False
 
 
@@ -407,6 +461,150 @@ async def send_safety_log(
         return True
     except (discord.Forbidden, discord.HTTPException) as error:
         print(f"Could not save chat safety log in {guild.name}: {error}")
+        return False
+
+
+def lfg_public_overwrites(guild: discord.Guild) -> dict:
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            add_reactions=False,
+            read_message_history=True,
+            connect=True,
+            speak=True,
+        )
+    }
+    if guild.me is not None:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            manage_messages=True,
+            read_message_history=True,
+            connect=True,
+            speak=True,
+            move_members=True,
+            manage_channels=True,
+        )
+    for role in guild.roles:
+        if role.name in STAFF_ROLE_NAMES:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                manage_messages=True,
+                read_message_history=True,
+                connect=True,
+                speak=True,
+                move_members=True,
+            )
+    return overwrites
+
+
+async def ensure_lfg_hub(guild: discord.Guild) -> dict[str, discord.abc.GuildChannel]:
+    lock = lfg_setup_locks.setdefault(guild.id, asyncio.Lock())
+    async with lock:
+        overwrites = lfg_public_overwrites(guild)
+        category = discord.utils.get(guild.categories, name=LFG_CATEGORY_NAME)
+        if category is None:
+            category = await guild.create_category(
+                LFG_CATEGORY_NAME,
+                overwrites=overwrites,
+                reason="Harps Community LFG setup",
+            )
+
+        channels: dict[str, discord.abc.GuildChannel] = {"category": category}
+        text_channel_settings = {
+            "rules": (LFG_RULES_CHANNEL_NAME, "Rules and safety guidance for LFG posts"),
+            "create": (LFG_CREATE_CHANNEL_NAME, "Create a new Harps Community LFG listing"),
+            "active": (LFG_ACTIVE_CHANNEL_NAME, "Active team-finder listings"),
+            "completed": (LFG_COMPLETED_CHANNEL_NAME, "Closed and expired LFG listings"),
+        }
+        for key, (name, topic) in text_channel_settings.items():
+            channel = discord.utils.get(category.text_channels, name=name)
+            if channel is None:
+                channel = await guild.create_text_channel(
+                    name,
+                    category=category,
+                    overwrites=overwrites,
+                    topic=topic,
+                    reason="Harps Community LFG setup",
+                )
+            channels[key] = channel
+
+        log_channel = discord.utils.get(category.text_channels, name=LFG_LOG_CHANNEL_NAME)
+        if log_channel is None:
+            log_channel = await guild.create_text_channel(
+                LFG_LOG_CHANNEL_NAME,
+                category=category,
+                overwrites=staff_overwrites(guild),
+                topic="Private LFG creation, membership and closure logs",
+                reason="Harps Community LFG setup",
+            )
+        channels["logs"] = log_channel
+
+        voice_creator = discord.utils.get(
+            category.voice_channels, name=LFG_VOICE_CREATOR_NAME
+        )
+        if voice_creator is None:
+            voice_creator = await guild.create_voice_channel(
+                LFG_VOICE_CREATOR_NAME,
+                category=category,
+                overwrites=overwrites,
+                user_limit=0,
+                reason="Harps Community LFG setup",
+            )
+        channels["voice"] = voice_creator
+        return channels
+
+
+async def get_lfg_channel(
+    guild: discord.Guild, key: str, *, create_if_missing: bool = True
+) -> discord.abc.GuildChannel | None:
+    category = discord.utils.get(guild.categories, name=LFG_CATEGORY_NAME)
+    names = {
+        "rules": LFG_RULES_CHANNEL_NAME,
+        "create": LFG_CREATE_CHANNEL_NAME,
+        "active": LFG_ACTIVE_CHANNEL_NAME,
+        "completed": LFG_COMPLETED_CHANNEL_NAME,
+        "logs": LFG_LOG_CHANNEL_NAME,
+        "voice": LFG_VOICE_CREATOR_NAME,
+    }
+    if category is not None and key in names:
+        channel = discord.utils.get(category.channels, name=names[key])
+        if channel is not None or not create_if_missing:
+            return channel
+    elif not create_if_missing:
+        return None
+    return (await ensure_lfg_hub(guild)).get(key)
+
+
+async def send_lfg_log(
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    *,
+    color: discord.Color = discord.Color.blurple(),
+    fields: list[tuple[str, str, bool]] | None = None,
+) -> bool:
+    try:
+        channel = await get_lfg_channel(guild, "logs")
+        if not isinstance(channel, discord.TextChannel):
+            return False
+        embed = discord.Embed(
+            title=title,
+            description=shortened(description, 4000),
+            color=color,
+            timestamp=discord.utils.utcnow(),
+        )
+        for name, value, inline in fields or []:
+            embed.add_field(
+                name=shortened(name, 250), value=shortened(value, 1024), inline=inline
+            )
+        embed.set_footer(text="Harps Community • LFG Log")
+        await channel.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"Could not save LFG log in {guild.name}: {error}")
         return False
 
 
@@ -2203,6 +2401,698 @@ class SafetyReviewView(discord.ui.View):
         )
 
 
+def lfg_metadata(message: discord.Message) -> dict[str, int] | None:
+    if not message.embeds:
+        return None
+    footer = message.embeds[0].footer.text or ""
+    match = re.fullmatch(
+        r"harps-lfg:guild=(\d+);host=(\d+);capacity=(\d+);expires=(\d+)",
+        footer,
+    )
+    if match is None:
+        return None
+    return {
+        "guild_id": int(match.group(1)),
+        "host_id": int(match.group(2)),
+        "capacity": int(match.group(3)),
+        "expires": int(match.group(4)),
+    }
+
+
+def lfg_embed_field(embed: discord.Embed, name: str) -> str | None:
+    field = discord.utils.get(embed.fields, name=name)
+    return field.value if field is not None else None
+
+
+def set_lfg_embed_field(embed: discord.Embed, name: str, value: str) -> None:
+    for index, field in enumerate(embed.fields):
+        if field.name == name:
+            embed.set_field_at(index, name=name, value=value, inline=field.inline)
+            return
+    embed.add_field(name=name, value=value, inline=False)
+
+
+def lfg_player_ids(embed: discord.Embed) -> list[int]:
+    value = lfg_embed_field(embed, "Players") or ""
+    return [int(item) for item in re.findall(r"<@(\d+)>", value)]
+
+
+def lfg_status(embed: discord.Embed) -> str:
+    return lfg_embed_field(embed, "Status") or "Unknown"
+
+
+async def find_active_lfg_for_host(
+    channel: discord.TextChannel, host_id: int
+) -> discord.Message | None:
+    async for message in channel.history(limit=200):
+        metadata = lfg_metadata(message)
+        if metadata is None or metadata["host_id"] != host_id or not message.embeds:
+            continue
+        if lfg_status(message.embeds[0]) in {"🟢 Open", "🔴 Full"}:
+            return message
+    return None
+
+
+class LFGChoiceSelect(discord.ui.Select):
+    def __init__(
+        self,
+        session: dict[str, str | int],
+        key: str,
+        placeholder: str,
+        options: list[discord.SelectOption],
+        row: int,
+    ):
+        self.session = session
+        self.key = key
+        super().__init__(
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.session[self.key] = self.values[0]
+        await interaction.response.defer()
+
+
+class LFGSetupView(discord.ui.View):
+    def __init__(self, member: discord.Member):
+        super().__init__(timeout=180)
+        self.member_id = member.id
+        self.session: dict[str, str | int] = {"host_id": member.id}
+        self.add_item(
+            LFGChoiceSelect(
+                self.session,
+                "game",
+                "1. Choose a game",
+                [
+                    discord.SelectOption(label=label, value=value, emoji="🎮")
+                    for value, label in LFG_GAMES.items()
+                ],
+                0,
+            )
+        )
+        self.add_item(
+            LFGChoiceSelect(
+                self.session,
+                "capacity",
+                "2. Choose a team size",
+                [
+                    discord.SelectOption(
+                        label=label,
+                        value=value,
+                        description=f"Up to {value} players",
+                    )
+                    for value, label in LFG_TEAM_SIZES.items()
+                ],
+                1,
+            )
+        )
+        self.add_item(
+            LFGChoiceSelect(
+                self.session,
+                "region",
+                "3. Choose your region",
+                [
+                    discord.SelectOption(label=label, value=value, emoji="🌍")
+                    for value, label in LFG_REGIONS.items()
+                ],
+                2,
+            )
+        )
+        self.add_item(
+            LFGChoiceSelect(
+                self.session,
+                "platform",
+                "4. Choose your platform",
+                [
+                    discord.SelectOption(label=label, value=value, emoji="🕹️")
+                    for value, label in LFG_PLATFORMS.items()
+                ],
+                3,
+            )
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message(
+                "This LFG setup belongs to another member.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Continue",
+        style=discord.ButtonStyle.primary,
+        emoji="➡️",
+        row=4,
+    )
+    async def continue_setup(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        missing = [
+            key for key in ("game", "capacity", "region", "platform")
+            if key not in self.session
+        ]
+        if missing:
+            await interaction.response.send_message(
+                "Choose a game, team size, region and platform first.", ephemeral=True
+            )
+            return
+        await interaction.response.edit_message(
+            content="Almost done — choose your language and microphone preference.",
+            view=LFGDetailsView(self.member_id, self.session),
+        )
+
+
+class LFGDetailsView(discord.ui.View):
+    def __init__(self, member_id: int, session: dict[str, str | int]):
+        super().__init__(timeout=180)
+        self.member_id = member_id
+        self.session = session
+        self.add_item(
+            LFGChoiceSelect(
+                self.session,
+                "language",
+                "5. Choose your language",
+                [
+                    discord.SelectOption(label="Greek", value="Greek", emoji="🇬🇷"),
+                    discord.SelectOption(label="English", value="English", emoji="🇬🇧"),
+                    discord.SelectOption(label="Greek & English", value="Greek & English", emoji="🌐"),
+                ],
+                0,
+            )
+        )
+        self.add_item(
+            LFGChoiceSelect(
+                self.session,
+                "microphone",
+                "6. Is a microphone required?",
+                [
+                    discord.SelectOption(label="Required", value="Required", emoji="🎙️"),
+                    discord.SelectOption(label="Optional", value="Optional", emoji="🔈"),
+                    discord.SelectOption(label="Not required", value="Not required", emoji="🔇"),
+                ],
+                1,
+            )
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message(
+                "This LFG setup belongs to another member.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Add Details & Publish",
+        style=discord.ButtonStyle.success,
+        emoji="📝",
+        row=2,
+    )
+    async def open_details(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if "language" not in self.session or "microphone" not in self.session:
+            await interaction.response.send_message(
+                "Choose your language and microphone preference first.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(LFGDetailsModal(self.session))
+
+
+class LFGDetailsModal(discord.ui.Modal, title="Finish Your LFG Listing"):
+    def __init__(self, session: dict[str, str | int]):
+        super().__init__(timeout=300)
+        self.session = session.copy()
+        self.rank = discord.ui.TextInput(
+            label="Rank / skill level",
+            placeholder="Example: Gold, experienced, or any rank",
+            default="Any rank / skill level",
+            max_length=100,
+            required=False,
+        )
+        self.play_time = discord.ui.TextInput(
+            label="When are you playing?",
+            placeholder="Example: Now, tonight at 20:00, or weekends",
+            max_length=100,
+        )
+        self.requirements = discord.ui.TextInput(
+            label="Requirements and details",
+            placeholder="Describe the team, age preference, play style, goals, etc.",
+            style=discord.TextStyle.paragraph,
+            max_length=700,
+        )
+        self.add_item(self.rank)
+        self.add_item(self.play_time)
+        self.add_item(self.requirements)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        user_text = "\n".join(
+            (str(self.rank), str(self.play_time), str(self.requirements))
+        )
+        if LINK_PATTERN.search(user_text):
+            await interaction.response.send_message(
+                "Links and Discord invites are not allowed in LFG listings.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await create_lfg_listing(
+            interaction,
+            self.session,
+            rank=str(self.rank).strip() or "Any rank / skill level",
+            play_time=str(self.play_time).strip(),
+            requirements=str(self.requirements).strip(),
+        )
+
+
+class LFGCreatePanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Create LFG",
+        style=discord.ButtonStyle.primary,
+        emoji="🎮",
+        custom_id="harps:lfg:create",
+    )
+    async def create_lfg(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "LFG listings can only be created inside the server.", ephemeral=True
+            )
+            return
+        active_channel = await get_lfg_channel(
+            interaction.guild, "active", create_if_missing=False
+        )
+        if isinstance(active_channel, discord.TextChannel):
+            existing = await find_active_lfg_for_host(
+                active_channel, interaction.user.id
+            )
+            if existing is not None:
+                await interaction.response.send_message(
+                    f"You already have an active LFG listing: {existing.jump_url}",
+                    ephemeral=True,
+                )
+                return
+        await interaction.response.send_message(
+            "Build your team by completing each selection below.",
+            view=LFGSetupView(interaction.user),
+            ephemeral=True,
+        )
+
+
+async def create_lfg_listing(
+    interaction: discord.Interaction,
+    session: dict[str, str | int],
+    *,
+    rank: str,
+    play_time: str,
+    requirements: str,
+) -> None:
+    guild = interaction.guild
+    if guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send(
+            "LFG listings can only be created inside the server.", ephemeral=True
+        )
+        return
+    if int(session.get("host_id", 0)) != interaction.user.id:
+        await interaction.followup.send("This LFG setup is not yours.", ephemeral=True)
+        return
+
+    lock_key = (guild.id, interaction.user.id)
+    lock = lfg_creation_locks.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        try:
+            channels = await ensure_lfg_hub(guild)
+            active_channel = channels["active"]
+            if not isinstance(active_channel, discord.TextChannel):
+                raise RuntimeError("The active LFG channel is unavailable.")
+            existing = await find_active_lfg_for_host(
+                active_channel, interaction.user.id
+            )
+            if existing is not None:
+                await interaction.followup.send(
+                    f"You already have an active LFG listing: {existing.jump_url}",
+                    ephemeral=True,
+                )
+                return
+
+            game_key = str(session["game"])
+            region_key = str(session["region"])
+            platform_key = str(session["platform"])
+            capacity_key = str(session["capacity"])
+            capacity = int(capacity_key)
+            expires_at = discord.utils.utcnow() + timedelta(hours=LFG_EXPIRY_HOURS)
+            embed = discord.Embed(
+                title=f"🎮 {LFG_GAMES[game_key]} • {LFG_TEAM_SIZES[capacity_key]}",
+                description=(
+                    f"{interaction.user.mention} is building a team. Use the buttons "
+                    "below to join, leave, contact the host, or close the listing."
+                ),
+                color=discord.Color.blurple(),
+                timestamp=discord.utils.utcnow(),
+            )
+            embed.add_field(name="Game", value=LFG_GAMES[game_key], inline=True)
+            embed.add_field(name="Team", value=LFG_TEAM_SIZES[capacity_key], inline=True)
+            embed.add_field(name="Region", value=LFG_REGIONS[region_key], inline=True)
+            embed.add_field(name="Platform", value=LFG_PLATFORMS[platform_key], inline=True)
+            embed.add_field(name="Language", value=str(session["language"]), inline=True)
+            embed.add_field(name="Microphone", value=str(session["microphone"]), inline=True)
+            embed.add_field(name="Rank / skill", value=shortened(rank, 100), inline=False)
+            embed.add_field(name="Playing", value=shortened(play_time, 100), inline=False)
+            embed.add_field(
+                name="Requirements", value=shortened(requirements, 700), inline=False
+            )
+            embed.add_field(name="Players", value=interaction.user.mention, inline=False)
+            embed.add_field(name="Team progress", value=f"**1 / {capacity}**", inline=True)
+            embed.add_field(name="Status", value="🟢 Open", inline=True)
+            embed.add_field(
+                name="Expires",
+                value=discord.utils.format_dt(expires_at, style="R"),
+                inline=True,
+            )
+            if guild.icon is not None:
+                embed.set_thumbnail(url=guild.icon.url)
+            embed.set_footer(
+                text=(
+                    f"harps-lfg:guild={guild.id};host={interaction.user.id};"
+                    f"capacity={capacity};expires={int(expires_at.timestamp())}"
+                )
+            )
+            listing = await active_channel.send(
+                embed=embed,
+                view=LFGListingView(),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.Forbidden, discord.HTTPException, KeyError, RuntimeError) as error:
+            await interaction.followup.send(
+                f"I could not publish the LFG listing: `{error}`", ephemeral=True
+            )
+            return
+        finally:
+            lfg_creation_locks.pop(lock_key, None)
+
+    await send_lfg_log(
+        guild,
+        "🎮 LFG Listing Created",
+        f"{interaction.user.mention} created a new listing in {active_channel.mention}.",
+        color=discord.Color.green(),
+        fields=[
+            ("Game", LFG_GAMES[game_key], True),
+            ("Team", LFG_TEAM_SIZES[capacity_key], True),
+            ("Listing", listing.jump_url, False),
+        ],
+    )
+    await interaction.followup.send(
+        f"✅ Your LFG listing is live: {listing.jump_url}", ephemeral=True
+    )
+
+
+async def lfg_listing_context(
+    interaction: discord.Interaction,
+) -> tuple[discord.Message, dict[str, int], discord.Member] | None:
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This LFG button can only be used inside the server.", ephemeral=True
+        )
+        return None
+    if interaction.message is None:
+        await interaction.response.send_message(
+            "I could not find this LFG listing.", ephemeral=True
+        )
+        return None
+    try:
+        message = await interaction.channel.fetch_message(interaction.message.id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        message = interaction.message
+    metadata = lfg_metadata(message)
+    if metadata is None or metadata["guild_id"] != interaction.guild.id:
+        await interaction.response.send_message(
+            "This is not a valid Harps Community LFG listing.", ephemeral=True
+        )
+        return None
+    return message, metadata, interaction.user
+
+
+async def update_lfg_players(
+    message: discord.Message,
+    embed: discord.Embed,
+    metadata: dict[str, int],
+    player_ids: list[int],
+) -> None:
+    player_text = "\n".join(f"<@{member_id}>" for member_id in player_ids)
+    set_lfg_embed_field(embed, "Players", player_text)
+    set_lfg_embed_field(
+        embed,
+        "Team progress",
+        f"**{len(player_ids)} / {metadata['capacity']}**",
+    )
+    full = len(player_ids) >= metadata["capacity"]
+    set_lfg_embed_field(embed, "Status", "🔴 Full" if full else "🟢 Open")
+    embed.color = discord.Color.red() if full else discord.Color.blurple()
+    await message.edit(
+        embed=embed,
+        view=LFGListingView(join_disabled=full),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def archive_lfg_listing(
+    message: discord.Message,
+    status: str,
+    *,
+    actor: discord.Member | None = None,
+) -> None:
+    metadata = lfg_metadata(message)
+    if metadata is None or not message.embeds or message.guild is None:
+        return
+    embed = discord.Embed.from_dict(message.embeds[0].to_dict())
+    set_lfg_embed_field(embed, "Status", status)
+    embed.color = discord.Color.dark_grey()
+    if actor is not None:
+        embed.add_field(
+            name="Closed by", value=f"{actor.mention} (`{actor.id}`)", inline=False
+        )
+    try:
+        await message.edit(
+            embed=embed,
+            view=LFGListingView(disabled=True),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+    completed_channel = await get_lfg_channel(message.guild, "completed")
+    if isinstance(completed_channel, discord.TextChannel):
+        await completed_channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    try:
+        await message.delete(reason=f"LFG listing archived: {status}")
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+    await send_lfg_log(
+        message.guild,
+        "✅ LFG Listing Archived",
+        f"Listing `{message.id}` was archived with status **{status}**.",
+        color=discord.Color.dark_grey(),
+        fields=[
+            ("Host", f"<@{metadata['host_id']}> (`{metadata['host_id']}`)", True),
+            (
+                "Action by",
+                f"{actor.mention} (`{actor.id}`)" if actor else "Automatic expiry",
+                True,
+            ),
+        ],
+    )
+
+
+class LFGListingView(discord.ui.View):
+    def __init__(self, *, join_disabled: bool = False, disabled: bool = False):
+        super().__init__(timeout=None)
+        for item in self.children:
+            if disabled or (item.custom_id == "harps:lfg:join" and join_disabled):
+                item.disabled = True
+
+    @discord.ui.button(
+        label="Join Team",
+        style=discord.ButtonStyle.success,
+        emoji="➕",
+        custom_id="harps:lfg:join",
+    )
+    async def join_team(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        context = await lfg_listing_context(interaction)
+        if context is None:
+            return
+        message, metadata, member = context
+        await interaction.response.defer(ephemeral=True)
+        lock = lfg_listing_locks.setdefault(message.id, asyncio.Lock())
+        async with lock:
+            try:
+                message = await interaction.channel.fetch_message(message.id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                await interaction.followup.send(
+                    "That listing is no longer available.", ephemeral=True
+                )
+                return
+            if metadata["expires"] <= int(discord.utils.utcnow().timestamp()):
+                await archive_lfg_listing(message, "⌛ Expired")
+                await interaction.followup.send(
+                    "That listing has expired.", ephemeral=True
+                )
+                return
+            embed = discord.Embed.from_dict(message.embeds[0].to_dict())
+            players = lfg_player_ids(embed)
+            if member.id in players:
+                await interaction.followup.send(
+                    "You are already in this team.", ephemeral=True
+                )
+                return
+            if len(players) >= metadata["capacity"]:
+                await interaction.followup.send("That team is full.", ephemeral=True)
+                return
+            players.append(member.id)
+            await update_lfg_players(message, embed, metadata, players)
+
+        host = interaction.guild.get_member(metadata["host_id"])
+        if host is not None:
+            try:
+                await host.send(
+                    f"➕ **{member}** joined your LFG team in **{interaction.guild.name}**.\n"
+                    f"Listing: {message.jump_url}"
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        await send_lfg_log(
+            interaction.guild,
+            "➕ Member Joined LFG",
+            f"{member.mention} joined <@{metadata['host_id']}>'s LFG team.",
+            color=discord.Color.green(),
+            fields=[("Listing", message.jump_url, False)],
+        )
+        await interaction.followup.send(
+            "✅ You joined the team. The host has been notified.", ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Leave Team",
+        style=discord.ButtonStyle.secondary,
+        emoji="➖",
+        custom_id="harps:lfg:leave",
+    )
+    async def leave_team(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        context = await lfg_listing_context(interaction)
+        if context is None:
+            return
+        message, metadata, member = context
+        if member.id == metadata["host_id"]:
+            await interaction.response.send_message(
+                "The host cannot leave their own listing. Use Close LFG instead.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        lock = lfg_listing_locks.setdefault(message.id, asyncio.Lock())
+        async with lock:
+            try:
+                message = await interaction.channel.fetch_message(message.id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                await interaction.followup.send(
+                    "That listing is no longer available.", ephemeral=True
+                )
+                return
+            embed = discord.Embed.from_dict(message.embeds[0].to_dict())
+            players = lfg_player_ids(embed)
+            if member.id not in players:
+                await interaction.followup.send(
+                    "You are not currently in this team.", ephemeral=True
+                )
+                return
+            players.remove(member.id)
+            await update_lfg_players(message, embed, metadata, players)
+        await send_lfg_log(
+            interaction.guild,
+            "➖ Member Left LFG",
+            f"{member.mention} left <@{metadata['host_id']}>'s LFG team.",
+            color=discord.Color.orange(),
+            fields=[("Listing", message.jump_url, False)],
+        )
+        await interaction.followup.send("You left the team.", ephemeral=True)
+
+    @discord.ui.button(
+        label="Contact Host",
+        style=discord.ButtonStyle.primary,
+        emoji="💬",
+        custom_id="harps:lfg:contact",
+    )
+    async def contact_host(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        context = await lfg_listing_context(interaction)
+        if context is None:
+            return
+        message, metadata, member = context
+        host = interaction.guild.get_member(metadata["host_id"])
+        if host is None:
+            await interaction.response.send_message(
+                "The host is no longer in the server.", ephemeral=True
+            )
+            return
+        if host.id == member.id:
+            await interaction.response.send_message(
+                "You are the host of this listing.", ephemeral=True
+            )
+            return
+        try:
+            await host.send(
+                f"💬 **{member}** wants to contact you about your LFG listing in "
+                f"**{interaction.guild.name}**.\nListing: {message.jump_url}"
+            )
+            result = "✅ The host was notified by DM. You can also open their profile from the mention below."
+        except (discord.Forbidden, discord.HTTPException):
+            result = "The host's DMs are closed. Open their profile from the mention below."
+        await interaction.response.send_message(
+            f"{result}\nHost: {host.mention}", ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Close LFG",
+        style=discord.ButtonStyle.danger,
+        emoji="🔒",
+        custom_id="harps:lfg:close",
+    )
+    async def close_lfg(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        context = await lfg_listing_context(interaction)
+        if context is None:
+            return
+        message, metadata, member = context
+        if member.id != metadata["host_id"] and not is_staff(member):
+            await interaction.response.send_message(
+                "Only the host or authorized staff can close this listing.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        lock = lfg_listing_locks.setdefault(message.id, asyncio.Lock())
+        async with lock:
+            await archive_lfg_listing(message, "✅ Closed", actor=member)
+        await interaction.followup.send("✅ The LFG listing was closed.", ephemeral=True)
+
+
 # Register persistent views before connecting so their buttons survive restarts.
 bot.add_view(TicketPanelView())
 bot.add_view(CloseTicketView())
@@ -2210,6 +3100,8 @@ bot.add_view(RoleRequestPanelView())
 bot.add_view(RoleRequestDecisionView())
 bot.add_view(BoostPanelView())
 bot.add_view(SafetyReviewView())
+bot.add_view(LFGCreatePanelView())
+bot.add_view(LFGListingView())
 
 
 async def remove_unsafe_message(message: discord.Message) -> bool:
@@ -2539,10 +3431,36 @@ async def inspect_message_for_safety(message: discord.Message) -> None:
         )
 
 
+@tasks.loop(minutes=15)
+async def lfg_expiry_task() -> None:
+    now_timestamp = int(discord.utils.utcnow().timestamp())
+    for guild in bot.guilds:
+        channel = await get_lfg_channel(guild, "active", create_if_missing=False)
+        if not isinstance(channel, discord.TextChannel):
+            continue
+        try:
+            async for message in channel.history(limit=200):
+                metadata = lfg_metadata(message)
+                if metadata is None or metadata["expires"] > now_timestamp:
+                    continue
+                lock = lfg_listing_locks.setdefault(message.id, asyncio.Lock())
+                async with lock:
+                    await archive_lfg_listing(message, "⌛ Expired")
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"Could not expire LFG listings in {guild.name}: {error}")
+
+
+@lfg_expiry_task.before_loop
+async def before_lfg_expiry_task() -> None:
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
     global slash_commands_synced
     print(f"✅ Logged in as {bot.user}")
+    if not lfg_expiry_task.is_running():
+        lfg_expiry_task.start()
     if not slash_commands_synced:
         try:
             guild_command_count = 0
@@ -3049,12 +3967,118 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     await log_reaction_event(payload, "Removed")
 
 
+async def handle_lfg_voice_state(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+) -> None:
+    guild = member.guild
+    category = discord.utils.get(guild.categories, name=LFG_CATEGORY_NAME)
+    if category is None:
+        return
+
+    if after.channel is not None and after.channel.name == LFG_VOICE_CREATOR_NAME:
+        lock_key = (guild.id, member.id)
+        lock = lfg_voice_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            existing = discord.utils.find(
+                lambda channel: (
+                    channel.name.startswith(LFG_TEMP_VOICE_PREFIX)
+                    and channel.overwrites_for(member).priority_speaker is True
+                ),
+                category.voice_channels,
+            )
+            if existing is not None:
+                try:
+                    await member.move_to(
+                        existing, reason="Returning member to their LFG voice room"
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+                return
+
+            safe_name = re.sub(r"[^\w '\-]", "", member.display_name).strip()
+            safe_name = safe_name[:70] or "Player"
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(
+                    view_channel=True, connect=True, speak=True
+                ),
+                member: discord.PermissionOverwrite(
+                    view_channel=True,
+                    connect=True,
+                    speak=True,
+                    priority_speaker=True,
+                ),
+            }
+            if guild.me is not None:
+                overwrites[guild.me] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    connect=True,
+                    speak=True,
+                    move_members=True,
+                    manage_channels=True,
+                )
+            try:
+                room = await guild.create_voice_channel(
+                    f"{LFG_TEMP_VOICE_PREFIX}{safe_name}'s Room"[:100],
+                    category=category,
+                    overwrites=overwrites,
+                    user_limit=5,
+                    reason=f"Temporary LFG voice room for {member} ({member.id})",
+                )
+                lfg_temp_voice_owners[room.id] = member.id
+                await member.move_to(
+                    room, reason="Moved member into their temporary LFG voice room"
+                )
+            except (discord.Forbidden, discord.HTTPException) as error:
+                print(f"Could not create/move to LFG voice room in {guild.name}: {error}")
+                if "room" in locals():
+                    try:
+                        await room.delete(reason="Could not move owner into LFG room")
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+                return
+            finally:
+                lfg_voice_locks.pop(lock_key, None)
+
+        await send_lfg_log(
+            guild,
+            "🔊 Temporary Voice Room Created",
+            f"{member.mention} created {room.mention}.",
+            color=discord.Color.green(),
+        )
+
+    if (
+        before.channel is not None
+        and before.channel.category_id == category.id
+        and before.channel.name.startswith(LFG_TEMP_VOICE_PREFIX)
+        and not before.channel.members
+    ):
+        channel_id = before.channel.id
+        try:
+            await before.channel.delete(reason="Empty temporary LFG voice room")
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+            print(f"Could not delete empty LFG voice room in {guild.name}: {error}")
+        else:
+            owner_id = lfg_temp_voice_owners.pop(channel_id, None)
+            await send_lfg_log(
+                guild,
+                "🔇 Temporary Voice Room Deleted",
+                f"Empty room `{channel_id}` was deleted.",
+                color=discord.Color.orange(),
+                fields=[
+                    ("Owner", f"<@{owner_id}>" if owner_id else "Unknown", True)
+                ],
+            )
+
+
 @bot.event
 async def on_voice_state_update(
     member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
 ):
     if before.channel == after.channel:
         return
+    await handle_lfg_voice_state(member, before, after)
     if before.channel is None:
         action = f"joined {after.channel.mention}"
         title = "🔊 Voice Channel Joined"
@@ -3981,6 +5005,180 @@ async def boostpanel(ctx: commands.Context):
     await ctx.send(f"✅ Server-boost panel posted in {channel.mention}.")
 
 
+async def upsert_lfg_embed(
+    channel: discord.TextChannel,
+    title: str,
+    embed: discord.Embed,
+    *,
+    view: discord.ui.View | None = None,
+) -> discord.Message:
+    async for message in channel.history(limit=50):
+        if (
+            bot.user is not None
+            and message.author.id == bot.user.id
+            and message.embeds
+            and message.embeds[0].title == title
+        ):
+            await message.edit(
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return message
+    return await channel.send(
+        embed=embed,
+        view=view,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.hybrid_group(name="lfg", fallback="status")
+@commands.has_permissions(administrator=True)
+async def lfg(ctx: commands.Context):
+    """Show the Harps Community LFG system status."""
+    category = discord.utils.get(ctx.guild.categories, name=LFG_CATEGORY_NAME)
+    active_channel = await get_lfg_channel(
+        ctx.guild, "active", create_if_missing=False
+    )
+    active_count = 0
+    if isinstance(active_channel, discord.TextChannel):
+        async for message in active_channel.history(limit=200):
+            metadata = lfg_metadata(message)
+            if metadata is not None and message.embeds and lfg_status(
+                message.embeds[0]
+            ) in {"🟢 Open", "🔴 Full"}:
+                active_count += 1
+    embed = discord.Embed(
+        title="🎮 Harps Community LFG",
+        description=(
+            "The LFG system lets members build Duos, Trios, Squads, 5 Stacks and "
+            "custom teams using persistent interactive listings."
+        ),
+        color=discord.Color.green() if category else discord.Color.orange(),
+    )
+    embed.add_field(
+        name="Status", value="✅ Ready" if category else "⚠️ Not set up", inline=True
+    )
+    embed.add_field(name="Active listings", value=str(active_count), inline=True)
+    embed.add_field(name="Listing lifetime", value=f"{LFG_EXPIRY_HOURS} hours", inline=True)
+    embed.add_field(
+        name="Supported games",
+        value=", ".join(LFG_GAMES.values()),
+        inline=False,
+    )
+    embed.add_field(
+        name="Setup command", value="Run `/lfg setup` once as an administrator.", inline=False
+    )
+    await ctx.send(embed=embed)
+
+
+@lfg.command(name="setup")
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(
+    manage_channels=True,
+    manage_messages=True,
+    move_members=True,
+    view_channel=True,
+    send_messages=True,
+)
+async def lfg_setup(ctx: commands.Context):
+    """Create or repair the complete LFG category, channels and panels."""
+    if ctx.interaction is not None:
+        await ctx.defer()
+    try:
+        channels = await ensure_lfg_hub(ctx.guild)
+        rules_channel = channels["rules"]
+        create_channel = channels["create"]
+        if not isinstance(rules_channel, discord.TextChannel) or not isinstance(
+            create_channel, discord.TextChannel
+        ):
+            raise RuntimeError("The LFG text channels could not be created.")
+
+        rules_embed = discord.Embed(
+            title="📌 Harps Community LFG Rules",
+            description=(
+                "Use LFG to find friendly teammates and build Duos, Trios, Squads or "
+                "full competitive teams. Keep every listing honest, respectful and safe."
+            ),
+            color=discord.Color.blurple(),
+        )
+        rules_embed.add_field(
+            name="Community rules",
+            value=(
+                "• No harassment, discrimination, trolling or toxic requirements.\n"
+                "• No links, Discord invites, advertisements, boosting or account sales.\n"
+                "• Do not share private information.\n"
+                "• Use accurate game, region, platform and rank information.\n"
+                "• Close your listing when the session is finished."
+            ),
+            inline=False,
+        )
+        rules_embed.add_field(
+            name="Voice rooms",
+            value=(
+                f"Join **{LFG_VOICE_CREATOR_NAME}** to receive a temporary room. "
+                "It is removed automatically when everyone leaves."
+            ),
+            inline=False,
+        )
+        rules_embed.set_footer(text="Harps Community • Play together, respect everyone")
+        await upsert_lfg_embed(
+            rules_channel, "📌 Harps Community LFG Rules", rules_embed
+        )
+
+        panel_embed = discord.Embed(
+            title="🎮 Find Your Team",
+            description=(
+                "Ready to play? Create a detailed LFG listing and let other Harps "
+                "Community members join your team."
+            ),
+            color=discord.Color.blurple(),
+        )
+        panel_embed.add_field(
+            name="How it works",
+            value=(
+                "1. Press **Create LFG**.\n"
+                "2. Choose your game, team size, region and platform.\n"
+                "3. Add language, microphone, rank, schedule and requirements.\n"
+                "4. Manage your team from the listing buttons."
+            ),
+            inline=False,
+        )
+        panel_embed.add_field(
+            name="Available formats",
+            value="Duo • Trio • Squad • 5 Stack • Custom Team",
+            inline=False,
+        )
+        panel_embed.add_field(
+            name="Automatic cleanup",
+            value=f"Listings expire after **{LFG_EXPIRY_HOURS} hours**.",
+            inline=False,
+        )
+        panel_embed.set_footer(text="Harps Community • Looking For Group")
+        panel_message = await upsert_lfg_embed(
+            create_channel,
+            "🎮 Find Your Team",
+            panel_embed,
+            view=LFGCreatePanelView(),
+        )
+    except (discord.Forbidden, discord.HTTPException, RuntimeError) as error:
+        await ctx.send(f"LFG setup failed: `{error}`")
+        return
+
+    await send_lfg_log(
+        ctx.guild,
+        "⚙️ LFG System Set Up",
+        f"The LFG hub was created or repaired by {ctx.author.mention}.",
+        color=discord.Color.green(),
+    )
+    await ctx.send(
+        "✅ LFG is ready.\n"
+        f"Create panel: {panel_message.jump_url}\n"
+        f"Active listings: {channels['active'].mention}\n"
+        f"Voice creator: {channels['voice'].mention}"
+    )
+
+
 @bot.hybrid_command()
 @commands.has_permissions(administrator=True)
 async def ticketpanel(ctx: commands.Context):
@@ -4009,6 +5207,8 @@ async def ticketpanel(ctx: commands.Context):
 @boostpanel.error
 @rolerequestpanel.error
 @rules.error
+@lfg_setup.error
+@lfg.error
 @safety_configure.error
 @safety_unwhitelist.error
 @safety_whitelist.error
