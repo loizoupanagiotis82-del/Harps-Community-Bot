@@ -4,7 +4,7 @@ import os
 import re
 import time
 from collections import defaultdict, deque
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import discord
 from discord.ext import commands
@@ -36,6 +36,39 @@ SERVER_LOG_CATEGORY_NAME = "📋 SERVER LOGS"
 ANTINUKE_WHITELIST_ROLE_NAME = "🛡️ Anti-Nuke Whitelist"
 ANTINUKE_MASS_THRESHOLD = 3
 ANTINUKE_WINDOW_SECONDS = 10
+SAFETY_CATEGORY_NAME = "🛡️ SAFETY CENTER"
+SAFETY_REVIEW_CHANNEL_NAME = "safety-review"
+SAFETY_LOG_CHANNEL_NAME = "safety-logs"
+SAFETY_WHITELIST_ROLE_NAME = "🛡️ Safety Whitelist"
+SAFETY_SPAM_WINDOW_SECONDS = 5
+SAFETY_DUPLICATE_WINDOW_SECONDS = 15
+SAFETY_INVITE_WINDOW_SECONDS = 60
+SAFETY_EVERYONE_WINDOW_SECONDS = 30
+SAFETY_INCIDENT_COOLDOWN_SECONDS = 30
+
+# These defaults are deliberately conservative. Borderline incidents are sent
+# to staff for review; only the higher "auto" thresholds cause a timeout.
+SAFETY_DEFAULT_CONFIG = {
+    "spam_review": 6,
+    "spam_auto": 10,
+    "mention_review": 5,
+    "mention_auto": 8,
+    "duplicate_review": 3,
+    "duplicate_auto": 6,
+    "invite_auto": 3,
+    "timeout_minutes": 10,
+}
+
+# Add invite codes belonging to Harps Community if the bot cannot read the
+# server's invite list. Use only the code, for example: {"harps", "abc123"}.
+SAFETY_ALLOWED_INVITE_CODES: set[str] = set()
+DISCORD_INVITE_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:discord(?:app)?\.com/invite|discord\.gg)/([a-z0-9-]+)",
+    re.IGNORECASE,
+)
+
+# Exact channel names added here are ignored by chat safety checks.
+SAFETY_EXEMPT_CHANNEL_NAMES: set[str] = set()
 
 # IDs placed here are always trusted, including bots that are not in the server yet.
 ANTINUKE_WHITELIST_IDS: set[int] = set()
@@ -101,6 +134,16 @@ antinuke_triggered: set[tuple[int, int]] = set()
 server_log_setup_locks: dict[int, asyncio.Lock] = {}
 recent_member_removals: dict[int, deque[tuple[float, int]]] = defaultdict(deque)
 last_member_removal_check: dict[int, float] = {}
+safety_message_activity: dict[tuple[int, int], deque[float]] = defaultdict(deque)
+safety_duplicate_activity: dict[
+    tuple[int, int], deque[tuple[float, str]]
+] = defaultdict(deque)
+safety_invite_activity: dict[tuple[int, int], deque[float]] = defaultdict(deque)
+safety_everyone_activity: dict[tuple[int, int], deque[float]] = defaultdict(deque)
+safety_incident_cooldowns: dict[tuple[int, int, str], float] = {}
+safety_setup_locks: dict[int, asyncio.Lock] = {}
+safety_review_action_locks: dict[int, asyncio.Lock] = {}
+safety_invite_cache: dict[int, tuple[float, set[str]]] = {}
 slash_commands_synced = False
 
 
@@ -227,6 +270,148 @@ async def send_server_log(
         return True
     except (discord.Forbidden, discord.HTTPException) as error:
         print(f"Could not save {log_type} log in {guild.name}: {error}")
+        return False
+
+
+def safety_config_topic(config: dict[str, int]) -> str:
+    values = ";".join(f"{key}={config[key]}" for key in SAFETY_DEFAULT_CONFIG)
+    return f"Harps Community staff review queue | harps-safety:v1;{values}"
+
+
+def safety_config_from_channel(
+    channel: discord.TextChannel | None,
+) -> dict[str, int]:
+    config = SAFETY_DEFAULT_CONFIG.copy()
+    if channel is None or "harps-safety:v1;" not in (channel.topic or ""):
+        return config
+    for key, value in re.findall(r"([a-z_]+)=(\d+)", channel.topic or ""):
+        if key in config:
+            config[key] = int(value)
+    return config
+
+
+def is_safety_whitelisted(member: discord.Member) -> bool:
+    return (
+        member.bot
+        or member.guild.owner_id == member.id
+        or is_staff(member)
+        or any(
+            role.name in {SAFETY_WHITELIST_ROLE_NAME, ANTINUKE_WHITELIST_ROLE_NAME}
+            for role in member.roles
+        )
+    )
+
+
+def is_safety_exempt_channel(channel: discord.abc.GuildChannel) -> bool:
+    if channel.name in SAFETY_EXEMPT_CHANNEL_NAMES:
+        return True
+    category = getattr(channel, "category", None)
+    return category is not None and category.name in {
+        SAFETY_CATEGORY_NAME,
+        SERVER_LOG_CATEGORY_NAME,
+        MOD_LOG_CATEGORY_NAME,
+        TICKET_LOG_CATEGORY_NAME,
+    }
+
+
+async def ensure_safety_whitelist_role(guild: discord.Guild) -> discord.Role:
+    role = discord.utils.get(guild.roles, name=SAFETY_WHITELIST_ROLE_NAME)
+    if role is None:
+        role = await guild.create_role(
+            name=SAFETY_WHITELIST_ROLE_NAME,
+            permissions=discord.Permissions.none(),
+            reason="Harps Community chat safety setup",
+        )
+    return role
+
+
+async def ensure_safety_center(
+    guild: discord.Guild,
+) -> tuple[discord.CategoryChannel, discord.TextChannel, discord.TextChannel, discord.Role]:
+    lock = safety_setup_locks.setdefault(guild.id, asyncio.Lock())
+    async with lock:
+        role = await ensure_safety_whitelist_role(guild)
+        category = discord.utils.get(guild.categories, name=SAFETY_CATEGORY_NAME)
+        if category is None:
+            category = await guild.create_category(
+                SAFETY_CATEGORY_NAME,
+                overwrites=staff_overwrites(guild),
+                reason="Harps Community chat safety setup",
+            )
+
+        review_channel = discord.utils.get(
+            category.text_channels, name=SAFETY_REVIEW_CHANNEL_NAME
+        )
+        if review_channel is None:
+            review_channel = await guild.create_text_channel(
+                SAFETY_REVIEW_CHANNEL_NAME,
+                category=category,
+                overwrites=staff_overwrites(guild),
+                topic=safety_config_topic(SAFETY_DEFAULT_CONFIG),
+                reason="Harps Community chat safety setup",
+            )
+
+        log_channel = discord.utils.get(
+            category.text_channels, name=SAFETY_LOG_CHANNEL_NAME
+        )
+        if log_channel is None:
+            log_channel = await guild.create_text_channel(
+                SAFETY_LOG_CHANNEL_NAME,
+                category=category,
+                overwrites=staff_overwrites(guild),
+                topic="Automatic chat safety detections and staff decisions",
+                reason="Harps Community chat safety setup",
+            )
+        return category, review_channel, log_channel, role
+
+
+async def get_safety_channel(
+    guild: discord.Guild, channel_type: str, *, create_if_missing: bool = True
+) -> discord.TextChannel | None:
+    category = discord.utils.get(guild.categories, name=SAFETY_CATEGORY_NAME)
+    channel_name = (
+        SAFETY_REVIEW_CHANNEL_NAME
+        if channel_type == "review"
+        else SAFETY_LOG_CHANNEL_NAME
+    )
+    if category is not None:
+        channel = discord.utils.get(category.text_channels, name=channel_name)
+        if channel is not None or not create_if_missing:
+            return channel
+    elif not create_if_missing:
+        return None
+
+    _, review_channel, log_channel, _ = await ensure_safety_center(guild)
+    return review_channel if channel_type == "review" else log_channel
+
+
+async def send_safety_log(
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    *,
+    color: discord.Color = discord.Color.blurple(),
+    fields: list[tuple[str, str, bool]] | None = None,
+) -> bool:
+    try:
+        channel = await get_safety_channel(guild, "log")
+        if channel is None:
+            return False
+        embed = discord.Embed(
+            title=title,
+            description=shortened(description, 4000),
+            color=color,
+            timestamp=discord.utils.utcnow(),
+        )
+        for name, value, inline in fields or []:
+            embed.add_field(
+                name=shortened(name, 250), value=shortened(value, 1024), inline=inline
+            )
+        embed.set_footer(text="Harps Community • Chat Safety Log")
+        await channel.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"Could not save chat safety log in {guild.name}: {error}")
         return False
 
 
@@ -1506,12 +1691,837 @@ class TicketPanelView(discord.ui.View):
         await create_ticket(interaction, "partnership", "Partnership / Other")
 
 
+def prune_safety_timestamps(
+    timestamps: deque[float], now: float, window_seconds: int
+) -> int:
+    while timestamps and now - timestamps[0] > window_seconds:
+        timestamps.popleft()
+    return len(timestamps)
+
+
+async def current_server_invite_codes(guild: discord.Guild) -> set[str]:
+    now = time.monotonic()
+    cached = safety_invite_cache.get(guild.id)
+    if cached is not None and now - cached[0] < 300:
+        return cached[1]
+    codes = {code.casefold() for code in SAFETY_ALLOWED_INVITE_CODES}
+    try:
+        invites = await guild.invites()
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    else:
+        codes.update(invite.code.casefold() for invite in invites)
+    safety_invite_cache[guild.id] = (now, codes)
+    return codes
+
+
+async def external_invites_in(message: discord.Message) -> list[str]:
+    found_codes = {
+        match.group(1).casefold()
+        for match in DISCORD_INVITE_PATTERN.finditer(message.content)
+    }
+    if not found_codes:
+        return []
+    allowed_codes = await current_server_invite_codes(message.guild)
+    return sorted(code for code in found_codes if code not in allowed_codes)
+
+
+def safety_review_metadata(message: discord.Message) -> dict[str, int | str] | None:
+    if not message.embeds:
+        return None
+    footer = message.embeds[0].footer.text or ""
+    match = re.fullmatch(
+        r"harps-safety:guild=(\d+);user=(\d+);source=(\d+);reason=([a-z_]+)",
+        footer,
+    )
+    if match is None:
+        return None
+    return {
+        "guild_id": int(match.group(1)),
+        "user_id": int(match.group(2)),
+        "source_id": int(match.group(3)),
+        "reason": match.group(4),
+    }
+
+
+def safety_review_is_pending(message: discord.Message) -> bool:
+    if not message.embeds:
+        return False
+    return any(
+        field.name == "Status" and field.value.startswith("⏳ Pending")
+        for field in message.embeds[0].fields
+    )
+
+
+async def refresh_review_message(message: discord.Message) -> discord.Message:
+    try:
+        return await message.channel.fetch_message(message.id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return message
+
+
+async def finish_safety_review(
+    message: discord.Message,
+    moderator: discord.Member,
+    action: str,
+    color: discord.Color,
+) -> None:
+    if not message.embeds:
+        return
+    embed = discord.Embed.from_dict(message.embeds[0].to_dict())
+    status = (
+        f"✅ **{action}**\nBy {moderator.mention} (`{moderator.id}`)\n"
+        f"{discord.utils.format_dt(discord.utils.utcnow(), style='F')}"
+    )
+    for index, field in enumerate(embed.fields):
+        if field.name == "Status":
+            embed.set_field_at(index, name="Status", value=status, inline=False)
+            break
+    embed.color = color
+    await message.edit(embed=embed, view=SafetyReviewView(disabled=True))
+
+
+async def send_safety_review(
+    message: discord.Message,
+    reason_code: str,
+    reason_name: str,
+    evidence: str,
+) -> bool:
+    try:
+        review_channel = await get_safety_channel(message.guild, "review")
+        if review_channel is None:
+            return False
+        embed = discord.Embed(
+            title="🔎 Chat Safety Review Required",
+            description=(
+                "The message was removed as a precaution, but **no punishment was "
+                "applied**. Staff can review the evidence and choose an action below."
+            ),
+            color=discord.Color.gold(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(
+            name="Member",
+            value=f"{message.author.mention}\n`{message.author.id}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Channel",
+            value=f"{message.channel.mention}\n`{message.channel.id}`",
+            inline=True,
+        )
+        embed.add_field(name="Detection", value=reason_name, inline=False)
+        embed.add_field(name="Evidence", value=shortened(evidence, 1024), inline=False)
+        embed.add_field(name="Source message ID", value=f"`{message.id}`", inline=False)
+        embed.add_field(
+            name="Status",
+            value="⏳ Pending staff review",
+            inline=False,
+        )
+        embed.set_footer(
+            text=(
+                f"harps-safety:guild={message.guild.id};user={message.author.id};"
+                f"source={message.id};reason={reason_code}"
+            )
+        )
+        await review_channel.send(embed=embed, view=SafetyReviewView())
+        return True
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"Could not create safety review in {message.guild.name}: {error}")
+        return False
+
+
+def safety_target_block_reason(
+    guild: discord.Guild,
+    moderator: discord.Member,
+    member: discord.Member,
+) -> str | None:
+    if member.id == guild.owner_id:
+        return "The server owner cannot be punished."
+    if bot.user is not None and member.id == bot.user.id:
+        return "I cannot punish myself."
+    if member.id == moderator.id:
+        return "You cannot use a review action on yourself."
+    if is_safety_whitelisted(member):
+        return "That member is now staff or safety-whitelisted."
+    if guild.me is None or member.top_role >= guild.me.top_role:
+        return "Move my bot role above the member's highest role first."
+    if moderator.id != guild.owner_id and member.top_role >= moderator.top_role:
+        return "You cannot moderate a member with an equal or higher role."
+    return None
+
+
+async def safety_review_context(
+    interaction: discord.Interaction,
+    required_permission: str,
+) -> tuple[discord.Message, dict[str, int | str], discord.Member] | None:
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This safety action can only be used in the server.", ephemeral=True
+        )
+        return None
+    if not is_staff(interaction.user):
+        await interaction.response.send_message(
+            "Only authorized Harps Community staff can review this incident.",
+            ephemeral=True,
+        )
+        return None
+    if not getattr(interaction.user.guild_permissions, required_permission, False):
+        await interaction.response.send_message(
+            f"You need the `{required_permission}` permission for that action.",
+            ephemeral=True,
+        )
+        return None
+    if interaction.message is None:
+        await interaction.response.send_message(
+            "I could not find the review message.", ephemeral=True
+        )
+        return None
+    message = await refresh_review_message(interaction.message)
+    metadata = safety_review_metadata(message)
+    if metadata is None or int(metadata["guild_id"]) != interaction.guild.id:
+        await interaction.response.send_message(
+            "This review card is invalid or incomplete.", ephemeral=True
+        )
+        return None
+    if not safety_review_is_pending(message):
+        await interaction.response.send_message(
+            "This incident has already been reviewed.", ephemeral=True
+        )
+        return None
+    return message, metadata, interaction.user
+
+
+class SafetyBanConfirmationView(discord.ui.View):
+    def __init__(
+        self,
+        review_message: discord.Message,
+        target_id: int,
+        moderator_id: int,
+        reason_code: str,
+    ):
+        super().__init__(timeout=30)
+        self.review_message = review_message
+        self.target_id = target_id
+        self.moderator_id = moderator_id
+        self.reason_code = reason_code
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.moderator_id:
+            await interaction.response.send_message(
+                "Only the staff member who opened this confirmation can use it.",
+                ephemeral=True,
+            )
+            return False
+        if not isinstance(interaction.user, discord.Member) or not is_staff(
+            interaction.user
+        ):
+            await interaction.response.send_message(
+                "You are no longer authorized to use this action.", ephemeral=True
+            )
+            return False
+        if not interaction.user.guild_permissions.ban_members:
+            await interaction.response.send_message(
+                "You need the `ban_members` permission for that action.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.edit_message(content="Ban cancelled.", view=None)
+
+    @discord.ui.button(label="Confirm Ban", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "This action can only be used in the server.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        lock = safety_review_action_locks.setdefault(
+            self.review_message.id, asyncio.Lock()
+        )
+        async with lock:
+            review_message = await refresh_review_message(self.review_message)
+            if not safety_review_is_pending(review_message):
+                await interaction.followup.send(
+                    "This incident has already been reviewed.", ephemeral=True
+                )
+                return
+
+            member = interaction.guild.get_member(self.target_id)
+            if member is not None:
+                blocked = safety_target_block_reason(
+                    interaction.guild, interaction.user, member
+                )
+                if blocked:
+                    await interaction.followup.send(blocked, ephemeral=True)
+                    return
+            try:
+                await interaction.guild.ban(
+                    member or discord.Object(id=self.target_id),
+                    reason=(
+                        f"Chat safety review: {self.reason_code.replace('_', ' ')} | "
+                        f"Moderator: {interaction.user} ({interaction.user.id})"
+                    ),
+                    delete_message_seconds=0,
+                )
+            except (discord.Forbidden, discord.HTTPException) as error:
+                await interaction.followup.send(
+                    f"I could not ban that member: `{error}`", ephemeral=True
+                )
+                return
+
+            await finish_safety_review(
+                review_message, interaction.user, "Member banned", discord.Color.red()
+            )
+            await send_safety_log(
+                interaction.guild,
+                "🔨 Safety Review: Member Banned",
+                (
+                    f"<@{self.target_id}> (`{self.target_id}`) was banned by "
+                    f"{interaction.user.mention} after staff review."
+                ),
+                color=discord.Color.red(),
+                fields=[
+                    ("Detection", self.reason_code.replace("_", " ").title(), False),
+                    ("Review card", f"`{review_message.id}`", False),
+                ],
+            )
+            if member is not None:
+                await send_mod_log(
+                    interaction.guild,
+                    "ban",
+                    "🔨 Member Banned from Safety Review",
+                    interaction.user,
+                    target=member,
+                    reason=self.reason_code.replace("_", " ").title(),
+                )
+            await interaction.followup.send(
+                f"🔨 <@{self.target_id}> was banned and the review was closed.",
+                ephemeral=True,
+            )
+
+
+class SafetyReviewView(discord.ui.View):
+    def __init__(self, *, disabled: bool = False):
+        super().__init__(timeout=None)
+        if disabled:
+            for item in self.children:
+                item.disabled = True
+
+    @discord.ui.button(
+        label="Dismiss",
+        style=discord.ButtonStyle.secondary,
+        emoji="✅",
+        custom_id="harps:safety:review:dismiss",
+    )
+    async def dismiss(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        context = await safety_review_context(interaction, "manage_messages")
+        if context is None:
+            return
+        message, metadata, moderator = context
+        await interaction.response.defer(ephemeral=True)
+        lock = safety_review_action_locks.setdefault(message.id, asyncio.Lock())
+        async with lock:
+            message = await refresh_review_message(message)
+            if not safety_review_is_pending(message):
+                await interaction.followup.send(
+                    "This incident has already been reviewed.", ephemeral=True
+                )
+                return
+            await finish_safety_review(
+                message, moderator, "Dismissed — no punishment", discord.Color.green()
+            )
+            await send_safety_log(
+                interaction.guild,
+                "✅ Safety Review Dismissed",
+                (
+                    f"Incident for <@{metadata['user_id']}> (`{metadata['user_id']}`) "
+                    f"was dismissed by {moderator.mention}."
+                ),
+                color=discord.Color.green(),
+                fields=[
+                    ("Detection", str(metadata["reason"]).replace("_", " ").title(), False),
+                    ("Review card", f"`{message.id}`", False),
+                ],
+            )
+        await interaction.followup.send(
+            "✅ Review dismissed with no member punishment.", ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Warn",
+        style=discord.ButtonStyle.primary,
+        emoji="⚠️",
+        custom_id="harps:safety:review:warn",
+    )
+    async def warn_member(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        context = await safety_review_context(interaction, "manage_messages")
+        if context is None:
+            return
+        message, metadata, moderator = context
+        target_id = int(metadata["user_id"])
+        member = interaction.guild.get_member(target_id)
+        if member is None:
+            await interaction.response.send_message(
+                "That member is no longer in the server. You can dismiss or ban the review.",
+                ephemeral=True,
+            )
+            return
+        if is_safety_whitelisted(member):
+            await interaction.response.send_message(
+                "That member is now staff or safety-whitelisted.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        lock = safety_review_action_locks.setdefault(message.id, asyncio.Lock())
+        async with lock:
+            message = await refresh_review_message(message)
+            if not safety_review_is_pending(message):
+                await interaction.followup.send(
+                    "This incident has already been reviewed.", ephemeral=True
+                )
+                return
+            reason = str(metadata["reason"]).replace("_", " ").title()
+            try:
+                await member.send(
+                    f"⚠️ You received a chat safety warning in **{interaction.guild.name}**.\n"
+                    f"Reason: {reason}"
+                )
+                dm_status = "Warning delivered by DM"
+            except (discord.Forbidden, discord.HTTPException):
+                dm_status = "DM could not be delivered"
+            await finish_safety_review(
+                message, moderator, f"Member warned ({dm_status})", discord.Color.gold()
+            )
+            await send_safety_log(
+                interaction.guild,
+                "⚠️ Safety Review: Member Warned",
+                f"{member.mention} (`{member.id}`) was warned by {moderator.mention}.",
+                color=discord.Color.gold(),
+                fields=[("Detection", reason, False), ("Delivery", dm_status, False)],
+            )
+            await send_mod_log(
+                interaction.guild,
+                "server",
+                "⚠️ Member Warned from Safety Review",
+                moderator,
+                target=member,
+                reason=reason,
+                details=dm_status,
+                color=discord.Color.gold(),
+            )
+        await interaction.followup.send(
+            f"⚠️ {member.mention} was warned and the review was closed.", ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Timeout",
+        style=discord.ButtonStyle.danger,
+        emoji="⏳",
+        custom_id="harps:safety:review:timeout",
+    )
+    async def timeout_member(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        context = await safety_review_context(interaction, "moderate_members")
+        if context is None:
+            return
+        message, metadata, moderator = context
+        member = interaction.guild.get_member(int(metadata["user_id"]))
+        if member is None:
+            await interaction.response.send_message(
+                "That member is no longer in the server.", ephemeral=True
+            )
+            return
+        blocked = safety_target_block_reason(interaction.guild, moderator, member)
+        if blocked:
+            await interaction.response.send_message(blocked, ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        lock = safety_review_action_locks.setdefault(message.id, asyncio.Lock())
+        async with lock:
+            message = await refresh_review_message(message)
+            if not safety_review_is_pending(message):
+                await interaction.followup.send(
+                    "This incident has already been reviewed.", ephemeral=True
+                )
+                return
+            config = safety_config_from_channel(
+                await get_safety_channel(interaction.guild, "review", create_if_missing=False)
+            )
+            minutes = config["timeout_minutes"]
+            until = discord.utils.utcnow() + timedelta(minutes=minutes)
+            reason = str(metadata["reason"]).replace("_", " ").title()
+            try:
+                await member.timeout(
+                    until,
+                    reason=(
+                        f"Chat safety review: {reason} | "
+                        f"Moderator: {moderator} ({moderator.id})"
+                    ),
+                )
+            except (discord.Forbidden, discord.HTTPException) as error:
+                await interaction.followup.send(
+                    f"I could not timeout that member: `{error}`", ephemeral=True
+                )
+                return
+            await finish_safety_review(
+                message,
+                moderator,
+                f"Timed out for {minutes} minutes",
+                discord.Color.orange(),
+            )
+            await send_safety_log(
+                interaction.guild,
+                "⏳ Safety Review: Member Timed Out",
+                f"{member.mention} (`{member.id}`) was timed out by {moderator.mention}.",
+                color=discord.Color.orange(),
+                fields=[
+                    ("Detection", reason, False),
+                    ("Duration", f"{minutes} minutes", True),
+                    ("Ends", discord.utils.format_dt(until, style="F"), True),
+                ],
+            )
+            await send_mod_log(
+                interaction.guild,
+                "server",
+                "⏳ Member Timed Out from Safety Review",
+                moderator,
+                target=member,
+                reason=reason,
+                details=f"Duration: {minutes} minutes",
+            )
+        await interaction.followup.send(
+            f"⏳ {member.mention} was timed out for {minutes} minutes.", ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Ban",
+        style=discord.ButtonStyle.danger,
+        emoji="🔨",
+        custom_id="harps:safety:review:ban",
+    )
+    async def ban_member(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        context = await safety_review_context(interaction, "ban_members")
+        if context is None:
+            return
+        message, metadata, moderator = context
+        target_id = int(metadata["user_id"])
+        member = interaction.guild.get_member(target_id)
+        if member is not None:
+            blocked = safety_target_block_reason(interaction.guild, moderator, member)
+            if blocked:
+                await interaction.response.send_message(blocked, ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Are you sure you want to ban <@{target_id}> (`{target_id}`)?",
+            view=SafetyBanConfirmationView(
+                message, target_id, moderator.id, str(metadata["reason"])
+            ),
+            ephemeral=True,
+        )
+
+
 # Register persistent views before connecting so their buttons survive restarts.
 bot.add_view(TicketPanelView())
 bot.add_view(CloseTicketView())
 bot.add_view(RoleRequestPanelView())
 bot.add_view(RoleRequestDecisionView())
 bot.add_view(BoostPanelView())
+bot.add_view(SafetyReviewView())
+
+
+async def remove_unsafe_message(message: discord.Message) -> bool:
+    try:
+        await message.delete(reason="Harps Community chat safety filter")
+        return True
+    except discord.NotFound:
+        return True
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"Could not remove unsafe message {message.id}: {error}")
+        return False
+
+
+async def automatically_timeout_for_safety(
+    member: discord.Member, reason_name: str, minutes: int
+) -> tuple[bool, str, datetime]:
+    guild = member.guild
+    if guild.me is None:
+        return False, "The bot member was not available.", discord.utils.utcnow()
+    if not guild.me.guild_permissions.moderate_members:
+        return False, "The bot needs the Moderate Members permission.", discord.utils.utcnow()
+    blocked = safety_target_block_reason(guild, guild.me, member)
+    if blocked:
+        return False, blocked, discord.utils.utcnow()
+    until = discord.utils.utcnow() + timedelta(minutes=minutes)
+    try:
+        await member.timeout(
+            until,
+            reason=f"Automatic chat safety action: {reason_name}",
+        )
+    except (discord.Forbidden, discord.HTTPException) as error:
+        return False, str(error), until
+    try:
+        await member.send(
+            f"⏳ You were automatically timed out for **{minutes} minutes** in "
+            f"**{guild.name}**.\nReason: {reason_name}\n"
+            "If you believe this was a mistake, please contact the staff team."
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    return True, "Timeout applied", until
+
+
+async def handle_safety_incident(
+    message: discord.Message,
+    reason_code: str,
+    reason_name: str,
+    evidence: str,
+    *,
+    automatic: bool,
+    config: dict[str, int],
+) -> None:
+    message_removed = await remove_unsafe_message(message)
+    now = time.monotonic()
+    cooldown_key = (message.guild.id, message.author.id, reason_code)
+    last_incident = safety_incident_cooldowns.get(cooldown_key, 0.0)
+    if now - last_incident < SAFETY_INCIDENT_COOLDOWN_SECONDS:
+        return
+    safety_incident_cooldowns[cooldown_key] = now
+
+    common_fields = [
+        ("Member", f"{message.author.mention}\n`{message.author.id}`", True),
+        ("Channel", f"{message.channel.mention}\n`{message.channel.id}`", True),
+        ("Detection", reason_name, False),
+        ("Evidence", shortened(evidence, 1024), False),
+        ("Message removed", "Yes" if message_removed else "No", True),
+    ]
+    if automatic:
+        success, result, until = await automatically_timeout_for_safety(
+            message.author, reason_name, config["timeout_minutes"]
+        )
+        if success:
+            await send_safety_log(
+                message.guild,
+                "🚨 Automatic Chat Safety Action",
+                (
+                    f"{message.author.mention} was automatically timed out for "
+                    f"**{config['timeout_minutes']} minutes** after clearly repeated abuse."
+                ),
+                color=discord.Color.red(),
+                fields=common_fields
+                + [("Timeout ends", discord.utils.format_dt(until, style="F"), False)],
+            )
+            await send_mod_log(
+                message.guild,
+                "server",
+                "🚨 Automatic Safety Timeout",
+                message.guild.me,
+                target=message.author,
+                reason=reason_name,
+                details=f"Duration: {config['timeout_minutes']} minutes",
+                color=discord.Color.red(),
+            )
+            return
+
+        review_evidence = f"{evidence}\n\nAutomatic timeout failed: {result}"
+        await send_safety_review(
+            message, reason_code, f"{reason_name} (automatic action failed)", review_evidence
+        )
+        await send_safety_log(
+            message.guild,
+            "⚠️ Automatic Safety Action Failed",
+            "The incident was moved to staff review because the timeout could not be applied.",
+            color=discord.Color.orange(),
+            fields=common_fields + [("Failure", result, False)],
+        )
+        return
+
+    review_created = await send_safety_review(
+        message, reason_code, reason_name, evidence
+    )
+    await send_safety_log(
+        message.guild,
+        "🔎 Chat Safety Incident Queued",
+        (
+            "The suspicious message was removed and queued for staff review. "
+            "No member punishment was applied."
+        ),
+        color=discord.Color.gold(),
+        fields=common_fields
+        + [("Review created", "Yes" if review_created else "No", True)],
+    )
+
+
+async def inspect_message_for_safety(message: discord.Message) -> None:
+    if message.guild is None or not isinstance(message.author, discord.Member):
+        return
+    if is_safety_whitelisted(message.author) or is_safety_exempt_channel(message.channel):
+        return
+
+    now = time.monotonic()
+    member_key = (message.guild.id, message.author.id)
+    review_channel = await get_safety_channel(
+        message.guild, "review", create_if_missing=False
+    )
+    config = safety_config_from_channel(review_channel)
+
+    message_times = safety_message_activity[member_key]
+    message_times.append(now)
+    message_count = prune_safety_timestamps(
+        message_times, now, SAFETY_SPAM_WINDOW_SECONDS
+    )
+
+    normalized = re.sub(r"\s+", " ", message.content).strip().casefold()
+    recent_content = safety_duplicate_activity[member_key]
+    while recent_content and now - recent_content[0][0] > SAFETY_DUPLICATE_WINDOW_SECONDS:
+        recent_content.popleft()
+    if normalized:
+        recent_content.append((now, normalized))
+    duplicate_count = (
+        sum(1 for _, content in recent_content if content == normalized)
+        if len(normalized) >= 5
+        else 0
+    )
+
+    external_codes = await external_invites_in(message)
+    invite_times = safety_invite_activity[member_key]
+    invite_times.extend(now for _ in external_codes)
+    invite_count = prune_safety_timestamps(
+        invite_times, now, SAFETY_INVITE_WINDOW_SECONDS
+    )
+
+    user_mentions = len(re.findall(r"<@!?\d+>", message.content))
+    role_mentions = len(re.findall(r"<@&\d+>", message.content))
+    mention_count = user_mentions + role_mentions
+    everyone_tokens = len(
+        re.findall(r"(?<!\w)@(everyone|here)\b", message.content, re.IGNORECASE)
+    )
+    everyone_times = safety_everyone_activity[member_key]
+    if everyone_tokens:
+        everyone_times.extend(now for _ in range(everyone_tokens))
+    everyone_count = prune_safety_timestamps(
+        everyone_times, now, SAFETY_EVERYONE_WINDOW_SECONDS
+    )
+
+    preview_parts = [message.content or "[empty message]"]
+    if message.attachments:
+        preview_parts.append(
+            "Attachments: " + ", ".join(item.filename for item in message.attachments)
+        )
+    preview = shortened("\n".join(preview_parts), 700)
+    metrics = (
+        f"Messages: {message_count}/{SAFETY_SPAM_WINDOW_SECONDS}s | "
+        f"Duplicates: {duplicate_count}/{SAFETY_DUPLICATE_WINDOW_SECONDS}s | "
+        f"Mentions: {mention_count} | @everyone/@here: {everyone_count}/"
+        f"{SAFETY_EVERYONE_WINDOW_SECONDS}s | External invites: {invite_count}/"
+        f"{SAFETY_INVITE_WINDOW_SECONDS}s"
+    )
+    evidence = f"**Message**\n{preview}\n\n**Detection totals**\n{metrics}"
+
+    if external_codes and invite_count >= config["invite_auto"]:
+        await handle_safety_incident(
+            message,
+            "repeated_external_invites",
+            "Repeated external Discord invites",
+            evidence,
+            automatic=True,
+            config=config,
+        )
+    elif mention_count >= config["mention_auto"]:
+        await handle_safety_incident(
+            message,
+            "mass_mentions",
+            "Mass user/role mentions",
+            evidence,
+            automatic=True,
+            config=config,
+        )
+    elif everyone_tokens >= 3 or everyone_count >= 3:
+        await handle_safety_incident(
+            message,
+            "repeated_everyone_mentions",
+            "Repeated @everyone/@here mentions",
+            evidence,
+            automatic=True,
+            config=config,
+        )
+    elif duplicate_count >= config["duplicate_auto"]:
+        await handle_safety_incident(
+            message,
+            "duplicate_message_flood",
+            "Repeated duplicate-message flood",
+            evidence,
+            automatic=True,
+            config=config,
+        )
+    elif message_count >= config["spam_auto"]:
+        await handle_safety_incident(
+            message,
+            "message_flood",
+            "High-speed message flood",
+            evidence,
+            automatic=True,
+            config=config,
+        )
+    elif external_codes:
+        await handle_safety_incident(
+            message,
+            "external_invite",
+            "External Discord invite",
+            evidence,
+            automatic=False,
+            config=config,
+        )
+    elif everyone_tokens:
+        await handle_safety_incident(
+            message,
+            "everyone_mention",
+            "@everyone/@here mention",
+            evidence,
+            automatic=False,
+            config=config,
+        )
+    elif mention_count >= config["mention_review"]:
+        await handle_safety_incident(
+            message,
+            "excessive_mentions",
+            "Excessive user/role mentions",
+            evidence,
+            automatic=False,
+            config=config,
+        )
+    elif duplicate_count >= config["duplicate_review"]:
+        await handle_safety_incident(
+            message,
+            "duplicate_messages",
+            "Repeated duplicate messages",
+            evidence,
+            automatic=False,
+            config=config,
+        )
+    elif message_count >= config["spam_review"]:
+        await handle_safety_incident(
+            message,
+            "rapid_messaging",
+            "Rapid messaging",
+            evidence,
+            automatic=False,
+            config=config,
+        )
 
 
 @bot.event
@@ -1540,6 +2550,10 @@ async def on_ready():
             await ensure_antinuke_whitelist_role(guild)
         except (discord.Forbidden, discord.HTTPException) as error:
             print(f"Could not initialize server logs/anti-nuke in {guild.name}: {error}")
+        try:
+            await ensure_safety_center(guild)
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"Could not initialize chat safety in {guild.name}: {error}")
         try:
             await update_member_count(guild)
         except (discord.Forbidden, discord.HTTPException) as error:
@@ -2074,6 +3088,7 @@ async def on_guild_update(before: discord.Guild, after: discord.Guild):
 async def on_invite_create(invite: discord.Invite):
     if invite.guild is None:
         return
+    safety_invite_cache.pop(invite.guild.id, None)
     await send_server_log(
         invite.guild,
         "server",
@@ -2091,6 +3106,7 @@ async def on_invite_create(invite: discord.Invite):
 async def on_invite_delete(invite: discord.Invite):
     if invite.guild is None:
         return
+    safety_invite_cache.pop(invite.guild.id, None)
     await send_server_log(
         invite.guild,
         "server",
@@ -2098,6 +3114,18 @@ async def on_invite_delete(invite: discord.Invite):
         f"Invite `{invite.code}` was deleted or expired.",
         color=discord.Color.red(),
     )
+
+
+@bot.listen("on_message")
+async def safety_message_listener(message: discord.Message):
+    """Run chat safety checks without replacing discord.py's command handler."""
+    try:
+        await inspect_message_for_safety(message)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        guild_name = message.guild.name if message.guild is not None else "direct messages"
+        print(f"Chat safety check failed in {guild_name}: {error}")
+    except Exception as error:
+        print(f"Unexpected chat safety error for message {message.id}: {error}")
 
 
 @bot.hybrid_command()
@@ -2537,6 +3565,208 @@ async def antinuke_unwhitelist(ctx: commands.Context, member: discord.Member):
     )
 
 
+@bot.hybrid_group(name="safety", fallback="status")
+@commands.has_permissions(administrator=True)
+async def safety(ctx: commands.Context):
+    """Show the current Harps Community chat safety status."""
+    review_channel = await get_safety_channel(
+        ctx.guild, "review", create_if_missing=False
+    )
+    log_channel = await get_safety_channel(ctx.guild, "log", create_if_missing=False)
+    whitelist_role = discord.utils.get(
+        ctx.guild.roles, name=SAFETY_WHITELIST_ROLE_NAME
+    )
+    config = safety_config_from_channel(review_channel)
+    embed = discord.Embed(
+        title="🛡️ Harps Community Chat Safety",
+        description=(
+            "Chat safety is **enabled** whenever the bot is online. Borderline incidents "
+            "are removed and held for staff review; only clearly repeated abuse receives "
+            "an automatic timeout."
+        ),
+        color=discord.Color.green(),
+    )
+    embed.add_field(
+        name="Rapid messages",
+        value=(
+            f"Review: **{config['spam_review']}** / {SAFETY_SPAM_WINDOW_SECONDS}s\n"
+            f"Automatic: **{config['spam_auto']}** / {SAFETY_SPAM_WINDOW_SECONDS}s"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Duplicate messages",
+        value=(
+            f"Review: **{config['duplicate_review']}** / "
+            f"{SAFETY_DUPLICATE_WINDOW_SECONDS}s\n"
+            f"Automatic: **{config['duplicate_auto']}** / "
+            f"{SAFETY_DUPLICATE_WINDOW_SECONDS}s"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Mentions per message",
+        value=(
+            f"Review: **{config['mention_review']}**\n"
+            f"Automatic: **{config['mention_auto']}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="External invites",
+        value=(
+            "First attempt: **staff review**\n"
+            f"Automatic: **{config['invite_auto']}** / {SAFETY_INVITE_WINDOW_SECONDS}s"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Automatic timeout",
+        value=f"**{config['timeout_minutes']} minutes**",
+        inline=True,
+    )
+    embed.add_field(
+        name="Safety whitelist",
+        value=whitelist_role.mention if whitelist_role else "Not created",
+        inline=True,
+    )
+    embed.add_field(
+        name="Staff channels",
+        value=(
+            f"Review: {review_channel.mention if review_channel else 'Not created'}\n"
+            f"Logs: {log_channel.mention if log_channel else 'Not created'}"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Staff, bots, owners and whitelisted members are ignored")
+    await ctx.send(embed=embed)
+
+
+@safety.command(name="setup")
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(
+    manage_guild=True,
+    manage_channels=True,
+    manage_roles=True,
+    manage_messages=True,
+    moderate_members=True,
+    ban_members=True,
+)
+async def safety_setup(ctx: commands.Context):
+    """Create the private safety center, review queue, logs and whitelist role."""
+    if ctx.interaction is not None:
+        await ctx.defer()
+    try:
+        _, review_channel, log_channel, role = await ensure_safety_center(ctx.guild)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        await ctx.send(f"Chat safety setup failed: `{error}`")
+        return
+    await ctx.send(
+        "✅ Chat safety is ready.\n"
+        f"Review queue: {review_channel.mention}\n"
+        f"Safety logs: {log_channel.mention}\n"
+        f"Whitelist: {role.mention}"
+    )
+
+
+@safety.command(name="whitelist")
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(manage_roles=True)
+async def safety_whitelist(ctx: commands.Context, member: discord.Member):
+    """Exempt a trusted member from chat safety checks."""
+    role = await ensure_safety_whitelist_role(ctx.guild)
+    if ctx.guild.me is None or role >= ctx.guild.me.top_role:
+        await ctx.send(f"Move my bot role above `{SAFETY_WHITELIST_ROLE_NAME}` first.")
+        return
+    if role in member.roles:
+        await ctx.send(f"{member.mention} is already safety-whitelisted.")
+        return
+    await member.add_roles(
+        role,
+        reason=f"Chat safety whitelist added by {ctx.author} ({ctx.author.id})",
+    )
+    await ctx.send(f"✅ {member.mention} is now ignored by chat safety checks.")
+    await send_safety_log(
+        ctx.guild,
+        "🛡️ Safety Whitelist Added",
+        f"{member.mention} was whitelisted by {ctx.author.mention}.",
+        color=discord.Color.green(),
+    )
+
+
+@safety.command(name="unwhitelist")
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(manage_roles=True)
+async def safety_unwhitelist(ctx: commands.Context, member: discord.Member):
+    """Remove a member from the chat safety whitelist."""
+    role = discord.utils.get(ctx.guild.roles, name=SAFETY_WHITELIST_ROLE_NAME)
+    if role is None or role not in member.roles:
+        await ctx.send(f"{member.mention} is not safety-whitelisted.")
+        return
+    await member.remove_roles(
+        role,
+        reason=f"Chat safety whitelist removed by {ctx.author} ({ctx.author.id})",
+    )
+    await ctx.send(f"✅ {member.mention} was removed from the safety whitelist.")
+    await send_safety_log(
+        ctx.guild,
+        "⚠️ Safety Whitelist Removed",
+        f"{member.mention} was removed by {ctx.author.mention}.",
+        color=discord.Color.orange(),
+    )
+
+
+@safety.command(name="configure")
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(manage_channels=True)
+async def safety_configure(ctx: commands.Context, setting: str, value: int):
+    """Change a safety threshold stored in the private review channel topic."""
+    limits = {
+        "spam_review": (3, 20),
+        "spam_auto": (4, 30),
+        "mention_review": (2, 20),
+        "mention_auto": (3, 50),
+        "duplicate_review": (2, 10),
+        "duplicate_auto": (3, 20),
+        "invite_auto": (2, 10),
+        "timeout_minutes": (1, 1440),
+    }
+    setting = setting.casefold().strip()
+    if setting not in limits:
+        await ctx.send(
+            "Unknown setting. Use one of: `" + "`, `".join(limits) + "`."
+        )
+        return
+    minimum, maximum = limits[setting]
+    if not minimum <= value <= maximum:
+        await ctx.send(f"`{setting}` must be between **{minimum}** and **{maximum}**.")
+        return
+    _, review_channel, _, _ = await ensure_safety_center(ctx.guild)
+    config = safety_config_from_channel(review_channel)
+    updated = config.copy()
+    updated[setting] = value
+    if updated["spam_review"] >= updated["spam_auto"]:
+        await ctx.send("`spam_review` must stay lower than `spam_auto`.")
+        return
+    if updated["mention_review"] >= updated["mention_auto"]:
+        await ctx.send("`mention_review` must stay lower than `mention_auto`.")
+        return
+    if updated["duplicate_review"] >= updated["duplicate_auto"]:
+        await ctx.send("`duplicate_review` must stay lower than `duplicate_auto`.")
+        return
+    await review_channel.edit(
+        topic=safety_config_topic(updated),
+        reason=f"Chat safety configured by {ctx.author} ({ctx.author.id})",
+    )
+    await ctx.send(f"✅ `{setting}` is now **{value}**.")
+    await send_safety_log(
+        ctx.guild,
+        "⚙️ Safety Configuration Updated",
+        f"`{setting}` was changed from **{config[setting]}** to **{value}** by {ctx.author.mention}.",
+        color=discord.Color.blurple(),
+    )
+
+
 @bot.hybrid_command()
 @commands.has_permissions(administrator=True)
 @commands.bot_has_permissions(manage_roles=True)
@@ -2771,6 +4001,11 @@ async def ticketpanel(ctx: commands.Context):
 @boostpanel.error
 @rolerequestpanel.error
 @rules.error
+@safety_configure.error
+@safety_unwhitelist.error
+@safety_whitelist.error
+@safety_setup.error
+@safety.error
 @antinuke_unwhitelist.error
 @antinuke_whitelist.error
 @antinuke_setup.error
